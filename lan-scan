@@ -1,0 +1,3775 @@
+#!/usr/bin/env python3
+"""lan-scan — find devices on the local net with mDNS, SSDP, and WS-Discovery
+
+Discovery via ARP, mDNS, SSDP, and WS-Discovery; per-host enrichment via
+NetBIOS, UPnP descriptions, WS-Discovery (DPWS) metadata, HTTP banner grabs,
+IPP printer attributes, reverse DNS, and a few vendor-specific pokes (e.g.
+Roku ECP, Philips Hue)."""
+
+import base64
+import curses
+import ipaddress
+import json
+import re
+import shutil
+import sys
+import socket
+import struct
+import time
+import uuid
+import asyncio
+import subprocess
+import urllib.request
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Callable, Optional
+from urllib.parse import urlparse
+
+CACHE_DIR = Path.home() / ".cache" / "lan-scan"
+MANUF_PATH = CACHE_DIR / "manuf"
+MANUF_URL = "https://www.wireshark.org/download/automated/data/manuf"
+HISTORY_DIR = CACHE_DIR / "history"
+# Cap on retained scans; older runs get pruned after each save so the cache
+# directory doesn't grow unboundedly.
+HISTORY_MAX = 50
+
+# Floor on the prefix length the nmap ARP sweep will target. The real subnet
+# can be much wider (a campus /16 has 65k addresses, nearly all unreachable at
+# L2 — an ARP sweep of the full range is pointless and slow), so for wider
+# masks we sweep a /22-aligned window around the local IP instead. /22 = 1024
+# addresses.
+ARP_SWEEP_MAX_PREFIX = 22
+
+
+@dataclass
+class Device:
+    address: str
+    model: Optional[str] = None
+    # Services are tracked by discovery source so we don't collide on identical
+    # short names (e.g. SSDP's "MediaRenderer" vs. mDNS's "_mediarenderer._tcp").
+    ssdp_services: set[str] = field(default_factory=set)
+    mdns_services: set[str] = field(default_factory=set)
+    # One entry per fetched LOCATION URL — devices often advertise several
+    # (rootdevice, MediaServer, MediaRenderer, etc.) and they don't all return
+    # the same document. Keyed by the URL the body came from.
+    xml_data: dict[str, bytes] = field(default_factory=dict)
+    mac_address: Optional[str] = None
+    oui_registrant: Optional[str] = None
+    txt_records: dict[str, str] = field(default_factory=dict)
+    rdns_name: Optional[str] = None
+    # Per-source NAME fields. Each producer writes only its own field; the
+    # resolver (see resolve_name) picks one at display time. See the priority
+    # documentation on the resolver function itself.
+    mdns_a_name: Optional[str] = None        # A record .local hostname
+    mdns_srv_name: Optional[str] = None      # SRV target .local hostname
+    mdns_instance_name: Optional[str] = None # Instance-name prefix (AirPlay-style)
+    upnp_friendly_name: Optional[str] = None # UPnP <friendlyName>
+    upnp_room_name: Optional[str] = None     # Sonos <roomName>
+    upnp_manufacturer: Optional[str] = None  # UPnP <manufacturer> (used for DEVICE polish)
+    upnp_device_type: Optional[str] = None   # UPnP <deviceType> URN (generic category fallback)
+    roku_friendly_name: Optional[str] = None # Roku ECP user-device-name / friendly-device-name
+    provenance: set[str] = field(default_factory=set)
+    location_urls: set[str] = field(default_factory=set)  # SSDP LOCATION URLs to fetch
+    roku_info: dict[str, str] = field(default_factory=dict)  # Roku ECP query/device-info
+    hue_info: dict[str, str] = field(default_factory=dict)    # Philips Hue /api/config JSON
+    # IPP Get-Printer-Attributes (enrich_ipp): naming fields broken out for the
+    # resolvers, plus a flat dict of the requested attributes for the detail view.
+    ipp_make_and_model: Optional[str] = None  # IPP 'printer-make-and-model'
+    ipp_info: Optional[str] = None            # IPP 'printer-info' (admin description)
+    ipp_attrs: dict[str, str] = field(default_factory=dict)
+    # WS-Discovery (UDP 3702): qualified Types like "tds:Device" (ONVIF camera),
+    # "wprt:PrintDeviceType", "pub:Computer" (Windows). XAddrs are SOAP endpoint
+    # URLs the device exposes for further metadata queries.
+    wsd_services: set[str] = field(default_factory=set)
+    wsd_xaddrs: set[str] = field(default_factory=set)
+    # DPWS endpoint reference (urn:uuid) from the ProbeMatch/Hello envelope —
+    # the logical wsa:To target for the WS-Transfer Get metadata query.
+    wsd_endpoint_ref: Optional[str] = None
+    # Metadata resolved by querying an XAddr with WS-Transfer Get (enrich_wsd):
+    # DPWS ThisModel (Manufacturer/ModelName) and ThisDevice (FriendlyName).
+    wsd_manufacturer: Optional[str] = None
+    wsd_model: Optional[str] = None          # DPWS <ModelName>
+    wsd_friendly_name: Optional[str] = None  # DPWS <FriendlyName>
+    # NetBIOS name service (UDP 137): the workstation's unique name (suffix 0x00)
+    # and the workgroup it belongs to (suffix 0x00, group flag set).
+    netbios_name: Optional[str] = None
+    netbios_workgroup: Optional[str] = None
+    # HTTP/HTTPS banner grab: port -> {"server": ..., "title": ..., "status": ...}
+    http_banners: dict[int, dict[str, str]] = field(default_factory=dict)
+    # Per-port outcome of every HTTP banner attempt, even when nothing usable
+    # came back. Values: "ok" (HTTP-shaped reply, recorded in http_banners),
+    # "non-http" (connected but didn't speak HTTP), "timeout" (no response in
+    # time), "closed" (refused or unreachable).
+    http_probe_results: dict[int, str] = field(default_factory=dict)
+    # MACs leaked through mDNS instance names (e.g. _apple-mobdev2._tcp PTR
+    # embeds the real Apple-assigned MAC even when the device is using a
+    # randomized MAC at the L2 layer). Value is "<oui_registrant>" or "".
+    leaked_macs: dict[str, str] = field(default_factory=dict)
+    is_new: bool = False  # not seen in the previous run
+
+    @property
+    def services(self) -> set[str]:
+        """Combined view of all advertised services, regardless of source."""
+        return self.ssdp_services | self.mdns_services | self.wsd_services
+
+    def __str__(self) -> str:
+        return f"{self.address:15} | {resolve_device_kind(self):40} | {resolve_name(self) or ''}"
+
+
+def get_arp_table() -> dict[str, str]:
+    """Get ARP table mapping IP addresses to MAC addresses."""
+    arp_table = {}
+    try:
+        result = subprocess.run(["arp", "-a"], capture_output=True, text=True, timeout=5)
+        for line in result.stdout.split("\n"):
+            # macOS format: "? (192.168.1.1) at aa:bb:cc:dd:ee:ff on en0 ifscope [ethernet]"
+            # Linux format: "? (192.168.1.1) at aa:bb:cc:dd:ee:ff [ether] on eth0"
+            if " at " in line and "(" in line:
+                try:
+                    ip_start = line.index("(") + 1
+                    ip_end = line.index(")")
+                    ip = line[ip_start:ip_end]
+
+                    at_idx = line.index(" at ") + 4
+                    mac_part = line[at_idx:].split()[0]
+                    # Normalize MAC format to uppercase with colons
+                    if mac_part and mac_part != "(incomplete)":
+                        mac = mac_part.upper().replace("-", ":")
+                        # Ensure each octet is 2 digits
+                        parts = mac.split(":")
+                        mac = ":".join(p.zfill(2) for p in parts)
+                        arp_table[ip] = mac
+                except (ValueError, IndexError):
+                    continue
+    except Exception:
+        pass
+    return arp_table
+
+
+def ensure_manuf() -> bool:
+    """Download Wireshark's manuf file to the cache on first run.
+
+    Returns True if a usable file is present. Failure is non-fatal — we just
+    fall back to the small built-in OUI table.
+    """
+    if MANUF_PATH.exists():
+        return True
+    print("Downloading OUI database from Wireshark (~190 KB, one-time)...")
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        urllib.request.urlretrieve(MANUF_URL, MANUF_PATH)
+        return True
+    except Exception as e:
+        print(f"  failed: {e}")
+        print("  falling back to limited built-in OUI database")
+        return False
+
+
+def _load_manuf() -> tuple[dict, dict, dict]:
+    """Parse the manuf file into (MA-L, MA-M, MA-S) dicts keyed by hex prefix.
+
+    MA-L  = 24-bit OUI (default, 6 hex chars)
+    MA-M  = 28-bit (7 hex chars)
+    MA-S  = 36-bit (9 hex chars)
+    """
+    ma_l: dict[str, str] = {}
+    ma_m: dict[str, str] = {}
+    ma_s: dict[str, str] = {}
+    try:
+        with open(MANUF_PATH, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.split("#", 1)[0].strip()
+                if not line:
+                    continue
+                parts = [p for p in line.split("\t") if p]
+                if len(parts) < 2:
+                    continue
+                addr_field, name = parts[0], parts[1].strip()
+                if "/" in addr_field:
+                    addr, mask_str = addr_field.split("/", 1)
+                    try:
+                        mask = int(mask_str)
+                    except ValueError:
+                        continue
+                else:
+                    addr, mask = addr_field, 24
+                hex_addr = addr.upper().replace(":", "").replace("-", "")
+                if mask == 24 and len(hex_addr) >= 6:
+                    ma_l[hex_addr[:6]] = name
+                elif mask == 28 and len(hex_addr) >= 7:
+                    ma_m[hex_addr[:7]] = name
+                elif mask == 36 and len(hex_addr) >= 9:
+                    ma_s[hex_addr[:9]] = name
+    except OSError:
+        pass
+    return ma_l, ma_m, ma_s
+
+
+_OUI_DB: Optional[tuple[dict, dict, dict]] = None
+
+
+def _get_oui_db() -> Optional[tuple[dict, dict, dict]]:
+    global _OUI_DB
+    if _OUI_DB is None and MANUF_PATH.exists():
+        _OUI_DB = _load_manuf()
+    return _OUI_DB
+
+
+def lookup_oui_registrant(mac: str) -> Optional[str]:
+    """Lookup MAC's manufacturer via the cached Wireshark manuf file."""
+    if not mac:
+        return None
+    hex_mac = mac.upper().replace(":", "").replace("-", "")
+    if len(hex_mac) < 6:
+        return None
+
+    db = _get_oui_db()
+    if db is None:
+        return None
+
+    ma_l, ma_m, ma_s = db
+    # Try the most specific match first (MA-S, then MA-M, then MA-L)
+    if hex_mac[:9] in ma_s:
+        return ma_s[hex_mac[:9]]
+    if hex_mac[:7] in ma_m:
+        return ma_m[hex_mac[:7]]
+    if hex_mac[:6] in ma_l:
+        return ma_l[hex_mac[:6]]
+    return None
+
+
+def _is_locally_administered_mac(mac: str) -> bool:
+    """True if the U/L bit (0x02 of the first octet) is set. Indicates the MAC
+    was not assigned out of an IEEE OUI block — typically per-SSID privacy
+    randomization on modern clients, but also VM/container bridges and
+    hand-set MACs. Not synonymous with 'randomized'."""
+    if not mac:
+        return False
+    try:
+        first = int(mac.split(":")[0], 16)
+    except (ValueError, IndexError):
+        return False
+    return bool(first & 0x02)
+
+
+def clean_mdns_service(name: str) -> str:
+    """Strip mDNS-style decoration: '_xxxxx._tcp.local' -> 'xxxxx'."""
+    name = name.rstrip(".")
+    for suffix in (".local",):
+        if name.endswith(suffix):
+            name = name[:-len(suffix)]
+    for suffix in ("._tcp", "._udp"):
+        if name.endswith(suffix):
+            name = name[:-len(suffix)]
+    if name.startswith("_"):
+        name = name[1:]
+    return name
+
+
+_MAC_PATTERN = re.compile(r"(?<![0-9A-Fa-f])([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})(?![0-9A-Fa-f])")
+
+# Identifies strings that are mostly hex-and-punctuation (UUIDs, bare MACs,
+# IPv6 fragments) and would be misleading as a device hostname.
+_UUID_OR_MAC = re.compile(r"^[0-9A-Fa-f:.\-]{12,}$")
+
+# Trailing run of >= 12 hex chars suggests a UUID-style identifier even when
+# preceded by a label (e.g. 'sonosRINCON_7828CAADE7B401400').
+_TRAILING_HEX_RUN = re.compile(r"[0-9A-Fa-f]{12,}$")
+
+
+def _looks_like_uuid_or_mac(s: str) -> bool:
+    return bool(_UUID_OR_MAC.match(s) or _TRAILING_HEX_RUN.search(s))
+
+
+_GENERIC_HTTP_SERVERS = ("nginx", "apache", "lighttpd", "openresty", "iis", "gunicorn", "envoy", "caddy")
+
+
+def _is_generic_http_server(server: str) -> bool:
+    """A bare 'nginx' or 'Apache/2.4' tells us nothing about the device kind."""
+    return server.lower().startswith(_GENERIC_HTTP_SERVERS)
+
+
+def _is_sonos_friendly_junk(s: str) -> bool:
+    """Sonos publishes friendlyName as '192.168.1.x - Sonos Play:1 - RINCON_...',
+    which is useless as a NAME. The Sonos roomName is the real label and ranks
+    above friendlyName in resolve_name, so this filter only kicks in when
+    roomName is somehow missing."""
+    return " - " in s and "RINCON_" in s
+
+
+def _printer_model_from_txt(txt: dict[str, str]) -> Optional[str]:
+    """Human-readable printer model from standard AirPrint/IPP/Mopria TXT keys.
+
+    These keys are defined by Apple's Bonjour Printing Specification and reused
+    by IPP Everywhere (PWG 5100.14) and Mopria, so they're cross-vendor — every
+    AirPrint/Mopria printer (HP, Canon, Epson, Brother, Lexmark, ...) advertises
+    them, not just Brother. Priority:
+        1. 'ty'                  the spec's human-readable display name
+        2. 'usb_MFG'+'usb_MDL'   IEEE-1284 Device ID manufacturer + model
+        3. 'product'             the PPD Product string (parenthesized by convention)
+    """
+    ty = (txt.get("ty") or "").strip()
+    if ty:
+        return ty
+    mdl = (txt.get("usb_MDL") or "").strip()
+    if mdl:
+        mfg = (txt.get("usb_MFG") or "").strip()
+        # usb_MDL sometimes already carries the brand; avoid "Brother Brother ...".
+        if mfg and mfg.lower() not in mdl.lower():
+            return f"{mfg} {mdl}"
+        return mdl
+    product = (txt.get("product") or "").strip().strip("()").strip()
+    if product:
+        return product
+    return None
+
+
+# HomeKit Accessory Protocol category identifiers (HAP spec "Accessory
+# Categories"), advertised as the `ci` key in `_hap._tcp` TXT records. This is
+# a standardized, cross-vendor device-category enum, so it makes a useful
+# DEVICE fallback for HomeKit gear that gives us nothing more specific.
+_HAP_CATEGORIES = {
+    1: "accessory", 2: "bridge", 3: "fan", 4: "garage door opener",
+    5: "light", 6: "lock", 7: "outlet", 8: "switch", 9: "thermostat",
+    10: "sensor", 11: "security system", 12: "door", 13: "window",
+    14: "window covering", 15: "programmable switch", 16: "range extender",
+    17: "IP camera", 18: "video doorbell", 19: "air purifier", 20: "heater",
+    21: "air conditioner", 22: "humidifier", 23: "dehumidifier", 26: "speaker",
+    28: "sprinkler", 29: "faucet", 30: "shower system", 32: "television",
+    33: "remote", 34: "Wi-Fi router", 35: "audio receiver",
+    36: "TV set-top box", 37: "TV streaming stick",
+}
+
+
+def _hap_category_from_txt(txt: dict[str, str]) -> Optional[str]:
+    """Map a HomeKit `ci` accessory-category integer to a display label."""
+    ci = txt.get("ci")
+    if not ci:
+        return None
+    try:
+        label = _HAP_CATEGORIES.get(int(ci))
+    except ValueError:
+        return None
+    if not label or label == "accessory":
+        return "HomeKit accessory"
+    return f"HomeKit {label}"
+
+
+def _unverified_tls_context():
+    """A TLS context that accepts any certificate. LAN devices (printers,
+    cameras, NAS) almost universally present self-signed certs with mismatched
+    hostnames, so verification would reject nearly all of them — and we only
+    want to read public banners/metadata, not establish authenticated trust
+    (the tradeoff: no MITM protection, irrelevant for read-only enumeration).
+    `ssl` is imported lazily so a Python build compiled without it still runs;
+    TLS probes just fail closed."""
+    import ssl
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
+def _xml_first_localname(body: str, tag: str) -> Optional[str]:
+    """First non-empty text of an element matched by local name only, ignoring
+    the (varying) namespace prefix — e.g. <wsdp:ModelName>, <dpws:ModelName>.
+    Used to scrape DPWS metadata without a namespace-aware parser, mirroring
+    the regex approach already used for WS-Discovery Types/XAddrs."""
+    pat = re.compile(rf"<(?:[\w.-]+:)?{tag}\b[^>]*>([^<]+)</(?:[\w.-]+:)?{tag}>", re.DOTALL)
+    for m in pat.finditer(body):
+        text = m.group(1).strip()
+        if text:
+            return text
+    return None
+
+
+# Operational state of a printer, from the IPP `printer-state` enum (RFC 8011).
+_IPP_PRINTER_STATES = {3: "idle", 4: "processing", 5: "stopped"}
+
+
+def _build_ipp_get_printer_attributes(printer_uri: str) -> bytes:
+    """Encode a minimal IPP/1.1 Get-Printer-Attributes request (RFC 8010).
+
+    Layout: 2-byte version (1.1), 2-byte operation-id (0x000B), 4-byte
+    request-id, then the required operation-attributes group (charset,
+    natural-language, printer-uri) plus a `requested-attributes` set limiting
+    the reply to the few naming/status fields we care about, terminated by the
+    end-of-attributes tag. IPP/1.1 is requested for the widest device support."""
+    def attr(value_tag: int, name: str, value: bytes) -> bytes:
+        return (bytes([value_tag]) + struct.pack(">H", len(name)) + name.encode()
+                + struct.pack(">H", len(value)) + value)
+
+    out = bytearray()
+    out += struct.pack(">BBHI", 1, 1, 0x000B, 1)   # version 1.1, Get-Printer-Attributes, req-id 1
+    out += bytes([0x01])                            # operation-attributes-tag
+    out += attr(0x47, "attributes-charset", b"utf-8")            # 0x47 charset
+    out += attr(0x48, "attributes-natural-language", b"en")      # 0x48 naturalLanguage
+    out += attr(0x45, "printer-uri", printer_uri.encode())       # 0x45 uri
+    requested = ["printer-make-and-model", "printer-info", "printer-location",
+                 "printer-state", "printer-state-reasons"]
+    # 0x44 keyword; a 1setOf is sent as the first value named and the rest as
+    # additional values with a zero-length name.
+    out += attr(0x44, "requested-attributes", requested[0].encode())
+    for extra in requested[1:]:
+        out += attr(0x44, "", extra.encode())
+    out += bytes([0x03])                            # end-of-attributes-tag
+    return bytes(out)
+
+
+def _decode_ipp_value(tag: int, val: bytes):
+    """Decode one IPP attribute value by its syntax tag (RFC 8010 §3.5.2)."""
+    if tag in (0x21, 0x23):                         # integer, enum
+        return struct.unpack(">i", val)[0] if len(val) == 4 else None
+    if tag == 0x22:                                 # boolean
+        return bool(val[0]) if val else None
+    if tag in (0x35, 0x36):                         # text/nameWithLanguage
+        try:
+            lang_len = struct.unpack(">H", val[0:2])[0]
+            toff = 2 + lang_len
+            text_len = struct.unpack(">H", val[toff:toff + 2])[0]
+            return val[toff + 2:toff + 2 + text_len].decode("utf-8", "ignore")
+        except Exception:
+            return val.decode("utf-8", "ignore")
+    # Everything else we request is a text-shaped syntax (textWithoutLanguage
+    # 0x41, keyword 0x44, uri 0x45, ...) — decode as a string.
+    return val.decode("utf-8", "ignore")
+
+
+def _parse_ipp_response(data: bytes) -> dict[str, list]:
+    """Walk an IPP response body into {attribute-name: [values]} (RFC 8010).
+
+    Tags 0x00–0x0F are delimiter/group tags (0x03 = end-of-attributes); tags
+    0x10+ are value tags. A value with a zero-length name is an additional
+    member of the preceding attribute's set."""
+    attrs: dict[str, list] = {}
+    if len(data) < 8:
+        return attrs
+    pos = 8  # skip 2-byte version + 2-byte status-code + 4-byte request-id
+    current = None
+    while pos < len(data):
+        tag = data[pos]
+        pos += 1
+        if tag <= 0x0F:                  # delimiter / group tag
+            if tag == 0x03:              # end-of-attributes
+                break
+            current = None
+            continue
+        if pos + 2 > len(data):
+            break
+        name_len = struct.unpack(">H", data[pos:pos + 2])[0]
+        pos += 2
+        name = data[pos:pos + name_len].decode("utf-8", "ignore")
+        pos += name_len
+        if pos + 2 > len(data):
+            break
+        val_len = struct.unpack(">H", data[pos:pos + 2])[0]
+        pos += 2
+        val = data[pos:pos + val_len]
+        pos += val_len
+        name = current if name_len == 0 else name
+        if not name:
+            continue
+        current = name
+        attrs.setdefault(name, []).append(_decode_ipp_value(tag, val))
+    return attrs
+
+
+def resolve_name(device: "Device") -> Optional[str]:
+    """Pick the best user-set name (the device's identity) for the NAME column.
+
+    Priority (highest first):
+        1. Roku ECP user-device-name      explicitly user-set in Roku settings
+        2. Sonos roomName                 explicitly user-set room name
+        3. UPnP friendlyName              usually user-set; Sonos junk filtered
+        4. DPWS ThisDevice FriendlyName   WS-Discovery metadata (printers, PCs,
+                                          cameras); peer of UPnP friendlyName
+        5. IPP 'printer-info'             admin-set printer description (enrich_ipp);
+                                          no mDNS equivalent
+        6. mDNS TXT 'fn'                  printer friendly name (AirPrint, IPP)
+        7. mDNS A record host             system hostname (e.g. MacBookAir.local)
+        8. mDNS instance prefix           AirPlay-style device name
+        9. NetBIOS workstation name       Windows install name (UPPER, 15 chars)
+       10. mDNS SRV target host           last-resort mDNS-derived name
+       11. Reverse DNS PTR                DHCP-assigned name, sometimes useful
+
+    Explicitly NOT considered: the SSDP `Server:` header (an OS string
+    like "Linux/2.6.18", not a device name), and IPP 'printer-location'
+    (a "where", surfaced in the detail view but not used as a NAME)."""
+    if device.roku_friendly_name:
+        return device.roku_friendly_name
+    if device.upnp_room_name:
+        return device.upnp_room_name
+    if device.upnp_friendly_name and not _is_sonos_friendly_junk(device.upnp_friendly_name):
+        return device.upnp_friendly_name
+    if device.wsd_friendly_name:
+        return device.wsd_friendly_name
+    if device.ipp_info:
+        return device.ipp_info
+    fn = device.txt_records.get("fn")
+    if fn:
+        return fn
+    if device.mdns_a_name:
+        return device.mdns_a_name
+    if device.mdns_instance_name:
+        return device.mdns_instance_name
+    if device.netbios_name:
+        return device.netbios_name
+    if device.mdns_srv_name:
+        return device.mdns_srv_name
+    if device.rdns_name:
+        return device.rdns_name
+    return None
+
+
+def resolve_device_kind(device: "Device") -> str:
+    """Pick the best identifier (the device's kind) for the DEVICE column.
+
+    Priority (highest first):
+        1. UPnP <modelName> (+ <manufacturer> prefix if not redundant)
+           — also covers Roku, which surfaces friendly-model-name via device.model
+        2. DPWS ThisModel <ModelName> (+ <Manufacturer> prefix)  WS-Discovery
+                                           metadata (printers, PCs, cameras)
+        3. mDNS TXT 'model' / 'am' / 'md'  Apple model identifiers
+        4. Printer TXT 'ty' / 'usb_MDL' / 'product'  cross-vendor AirPrint/IPP/
+                                           Mopria model name (see
+                                           _printer_model_from_txt)
+        5. IPP 'printer-make-and-model'    queried from the printer (enrich_ipp);
+                                           the only model source for mDNS-silent
+                                           printers reachable on port 631
+        6. HTTP Server header              vendor-y software string;
+                                           generic web-servers (nginx, Apache,
+                                           IIS, lighttpd, ...) are skipped
+        7. HomeKit TXT 'ci' category       standardized HAP accessory category
+                                           (generic: "HomeKit thermostat")
+        8. UPnP <deviceType> URN           generic UPnP category ("MediaServer")
+        9. [unknown <OUI registrant> device]   — manufacturer from MAC OUI
+       10. [unknown device]                    — locally-administered MAC, or
+                                                 OUI lookup failed"""
+    if device.model:
+        if device.upnp_manufacturer and device.upnp_manufacturer.lower() not in device.model.lower():
+            return f"{device.upnp_manufacturer} {device.model}"
+        return device.model
+    if device.wsd_model:
+        mfg = device.wsd_manufacturer
+        if mfg and mfg.lower() not in device.wsd_model.lower():
+            return f"{mfg} {device.wsd_model}"
+        return device.wsd_model
+    for key in ("model", "am", "md"):
+        v = device.txt_records.get(key)
+        if v:
+            return v
+    printer_model = _printer_model_from_txt(device.txt_records)
+    if printer_model:
+        return printer_model
+    if device.ipp_make_and_model:
+        return device.ipp_make_and_model
+    for banner in device.http_banners.values():
+        server = banner.get("server")
+        if server and not _is_generic_http_server(server):
+            return server
+    hap = _hap_category_from_txt(device.txt_records)
+    if hap:
+        return hap
+    if device.upnp_device_type:
+        return _upnp_short(device.upnp_device_type, "device")
+    if device.oui_registrant:
+        return f"[unknown {device.oui_registrant} device]"
+    return "[unknown device]"
+
+
+def plural(n: int, word: str) -> str:
+    return word if n == 1 else word + "s"
+
+
+def _device_to_dict(d) -> dict:
+    """Serialize a Device to a JSON-friendly dict. is_new is persisted so
+    review-mode display matches what the user originally saw."""
+    return {
+        "address": d.address,
+        "model": d.model,
+        "mac_address": d.mac_address,
+        "oui_registrant": d.oui_registrant,
+        "ssdp_services": sorted(d.ssdp_services),
+        "mdns_services": sorted(d.mdns_services),
+        "rdns_name": d.rdns_name,
+        "mdns_a_name": d.mdns_a_name,
+        "mdns_srv_name": d.mdns_srv_name,
+        "mdns_instance_name": d.mdns_instance_name,
+        "upnp_friendly_name": d.upnp_friendly_name,
+        "upnp_room_name": d.upnp_room_name,
+        "upnp_manufacturer": d.upnp_manufacturer,
+        "upnp_device_type": d.upnp_device_type,
+        "roku_friendly_name": d.roku_friendly_name,
+        "provenance": sorted(d.provenance),
+        "txt_records": d.txt_records,
+        "roku_info": d.roku_info,
+        "hue_info": d.hue_info,
+        "ipp_make_and_model": d.ipp_make_and_model,
+        "ipp_info": d.ipp_info,
+        "ipp_attrs": d.ipp_attrs,
+        "wsd_services": sorted(d.wsd_services),
+        "wsd_xaddrs": sorted(d.wsd_xaddrs),
+        "wsd_endpoint_ref": d.wsd_endpoint_ref,
+        "wsd_manufacturer": d.wsd_manufacturer,
+        "wsd_model": d.wsd_model,
+        "wsd_friendly_name": d.wsd_friendly_name,
+        "netbios_name": d.netbios_name,
+        "netbios_workgroup": d.netbios_workgroup,
+        # JSON keys are always strings; cast port ints back when loading.
+        "http_banners": {str(p): v for p, v in d.http_banners.items()},
+        "http_probe_results": {str(p): v for p, v in d.http_probe_results.items()},
+        "leaked_macs": d.leaked_macs,
+        "location_urls": sorted(d.location_urls),
+        "xml_data_b64_by_url": {
+            url: base64.b64encode(body).decode("ascii")
+            for url, body in d.xml_data.items()
+        },
+        "is_new": d.is_new,
+    }
+
+
+def _device_from_dict(data: dict) -> "Device":
+    """Inverse of _device_to_dict."""
+    xml_data = {
+        url: base64.b64decode(b64)
+        for url, b64 in (data.get("xml_data_b64_by_url") or {}).items()
+        if b64
+    }
+    return Device(
+        address=data["address"],
+        model=data.get("model"),
+        ssdp_services=set(data.get("ssdp_services") or []),
+        mdns_services=set(data.get("mdns_services") or []),
+        xml_data=xml_data,
+        mac_address=data.get("mac_address"),
+        oui_registrant=data.get("oui_registrant"),
+        txt_records=dict(data.get("txt_records") or {}),
+        rdns_name=data.get("rdns_name"),
+        mdns_a_name=data.get("mdns_a_name"),
+        mdns_srv_name=data.get("mdns_srv_name"),
+        mdns_instance_name=data.get("mdns_instance_name"),
+        upnp_friendly_name=data.get("upnp_friendly_name"),
+        upnp_room_name=data.get("upnp_room_name"),
+        upnp_manufacturer=data.get("upnp_manufacturer"),
+        upnp_device_type=data.get("upnp_device_type"),
+        roku_friendly_name=data.get("roku_friendly_name"),
+        provenance=set(data.get("provenance") or []),
+        location_urls=set(data.get("location_urls") or []),
+        roku_info=dict(data.get("roku_info") or {}),
+        hue_info=dict(data.get("hue_info") or {}),
+        ipp_make_and_model=data.get("ipp_make_and_model"),
+        ipp_info=data.get("ipp_info"),
+        ipp_attrs=dict(data.get("ipp_attrs") or {}),
+        wsd_services=set(data.get("wsd_services") or []),
+        wsd_xaddrs=set(data.get("wsd_xaddrs") or []),
+        wsd_endpoint_ref=data.get("wsd_endpoint_ref"),
+        wsd_manufacturer=data.get("wsd_manufacturer"),
+        wsd_model=data.get("wsd_model"),
+        wsd_friendly_name=data.get("wsd_friendly_name"),
+        netbios_name=data.get("netbios_name"),
+        netbios_workgroup=data.get("netbios_workgroup"),
+        http_banners={int(p): v for p, v in (data.get("http_banners") or {}).items()},
+        http_probe_results={int(p): v for p, v in (data.get("http_probe_results") or {}).items()},
+        leaked_macs=dict(data.get("leaked_macs") or {}),
+        is_new=bool(data.get("is_new", False)),
+    )
+
+
+def _history_paths() -> list[Path]:
+    """All saved runs, newest first (ISO-8601 filenames sort lexicographically)."""
+    if not HISTORY_DIR.exists():
+        return []
+    return sorted(HISTORY_DIR.glob("*.json"), reverse=True)
+
+
+def _prune_history() -> None:
+    """Delete the oldest runs over HISTORY_MAX."""
+    for old in _history_paths()[HISTORY_MAX:]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
+
+
+def load_run(path: Path) -> Optional[dict]:
+    """Load one saved run by path, or None if unreadable."""
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def list_history() -> list[dict]:
+    """Return history metadata newest-first for the startup menu.
+    Each entry: {'path': Path, 'timestamp': str, 'subnet': str, 'n_devices': int}."""
+    entries = []
+    for path in _history_paths():
+        data = load_run(path)
+        if not data:
+            continue
+        entries.append({
+            "path": path,
+            "timestamp": data.get("timestamp") or path.stem,
+            "subnet": data.get("subnet") or "?",
+            "n_devices": len(data.get("devices") or []),
+        })
+    return entries
+
+
+def _friendly_time(iso_ts: Optional[str], pad_hour: bool = False) -> str:
+    """Render a saved ISO-8601 timestamp as a friendly absolute time, e.g.
+    '1:25 PM, May 26' — or '4:40 PM, Mar 3, 2025' when the year differs from
+    the current one. Falls back to the raw string if it doesn't parse.
+    With pad_hour, the hour is right-aligned to width 2 (' 1:25' vs '12:49')
+    so a column of these lines up; used by the load-scans menu."""
+    try:
+        dt = datetime.fromisoformat(iso_ts)
+    except (ValueError, TypeError):
+        return iso_ts or "?"
+    hour = dt.hour % 12 or 12
+    hour_str = f"{hour:>2}" if pad_hour else str(hour)
+    clock = f"{hour_str}:{dt.minute:02d} {'AM' if dt.hour < 12 else 'PM'}"
+    date = f"{dt.strftime('%b')} {dt.day}"           # "%-d" isn't portable; build it
+    if dt.year != datetime.now().year:
+        date += f", {dt.year}"
+    return f"{clock}, {date}"
+
+
+def _run_summary(n_devices: int, subnet: Optional[str], timestamp: Optional[str],
+                 new: int = 0, missing: int = 0, align: bool = False) -> str:
+    """One-line scan summary shared by the load-scans menu and the TUI status
+    bar, e.g. '26 devices (15 new, 11 missing) on 192.168.1.0/24 at 1:25 PM,
+    May 26'. The new/missing breakdown is only passed for a live scan. With
+    align (the menu's multi-row listing), the device count is right-aligned to
+    width 3 and the hour to width 2 so the rows line up into columns."""
+    count = f"{n_devices:>3}" if align else str(n_devices)
+    summary = f"{count} {plural(n_devices, 'device')}"
+    breakdown = []
+    if new:
+        breakdown.append(f"{new} new")
+    if missing:
+        breakdown.append(f"{missing} missing")
+    if breakdown:
+        summary += " (" + ", ".join(breakdown) + ")"
+    summary += f" on {subnet or '?'}"
+    if timestamp:
+        summary += f" at {_friendly_time(timestamp, pad_hour=align)}"
+    return summary
+
+
+def save_run(devices, subnet: Optional[str], missing: Optional[list] = None) -> None:
+    """Persist this run's results so the next invocation can diff against it
+    and review mode can rehydrate the exact display."""
+    if not subnet:
+        return
+    timestamp = datetime.now().isoformat(timespec="seconds")
+    data = {
+        "subnet": subnet,
+        "timestamp": timestamp,
+        "devices": [_device_to_dict(d) for d in devices],
+        "missing_devices": missing or [],
+    }
+    try:
+        HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+        with open(HISTORY_DIR / f"{timestamp}.json", "w") as f:
+            json.dump(data, f, indent=2)
+        _prune_history()
+    except OSError:
+        pass  # cache write is best-effort
+
+
+def load_previous_run() -> Optional[dict]:
+    """Load the most-recent run, or None if no history exists. Used for
+    diffing the next scan and as the source for --print-previous /
+    --load-previous."""
+    runs = _history_paths()
+    if not runs:
+        return None
+    return load_run(runs[0])
+
+
+class NetworkDiscovery:
+    def __init__(self):
+        self.devices: dict[str, Device] = {}
+        self.arp_table: dict[str, str] = {}
+        # Populated by apply_diff(); list of dicts in the same shape as _device_to_dict
+        self.missing_devices: list[dict] = []
+        self.previous_timestamp: Optional[str] = None
+        # The scanned subnet, for the TUI status bar. Set during discover_arp on
+        # a live scan, or from the saved run in review mode (load_from).
+        self.subnet: Optional[str] = None
+
+    def load_from(self, previous: dict) -> None:
+        """Hydrate self.devices from a saved last-run.json dict (review mode)."""
+        for d in previous.get("devices", []):
+            try:
+                device = _device_from_dict(d)
+            except Exception:
+                continue
+            self.devices[device.address] = device
+        self.missing_devices = previous.get("missing_devices", []) or []
+        self.previous_timestamp = previous.get("timestamp")
+        self.subnet = previous.get("subnet")
+
+    def apply_diff(self, previous: dict) -> None:
+        """Mark devices not in the previous run as new; record any devices
+        that were present last time but not this time."""
+        previous_devices = previous.get("devices", [])
+        previous_addrs = {d["address"] for d in previous_devices}
+
+        for addr, dev in self.devices.items():
+            if addr not in previous_addrs:
+                dev.is_new = True
+
+        current_addrs = set(self.devices.keys())
+        self.missing_devices = [d for d in previous_devices if d["address"] not in current_addrs]
+        self.previous_timestamp = previous.get("timestamp")
+
+    def add_device(
+        self,
+        address: str,
+        service: str = None,
+        model: str = None,
+        source: str = None,
+    ):
+        if address not in self.devices:
+            self.devices[address] = Device(address)
+        device = self.devices[address]
+        if service:
+            if source == "ssdp":
+                device.ssdp_services.add(service)
+            elif source == "mdns":
+                device.mdns_services.add(service)
+            else:
+                raise ValueError(
+                    f"add_device({address!r}, service={service!r}) requires "
+                    f"source='ssdp' or source='mdns', got source={source!r}"
+                )
+        if model and not device.model:
+            device.model = model
+        if source:
+            device.provenance.add(source)
+        return device
+
+    async def discover_mdns(self, timeout: float = 3.0):
+        """Discover devices via mDNS (multicast DNS).
+
+        Sends a `_services._dns-sd._udp` meta-query (auto-surfaces every service
+        type a responsive device advertises) plus a hand-picked list of common
+        types. New service types learned mid-scan get a follow-up PTR query
+        sent during the second half of the window so we resolve SRV/TXT/A
+        records for service types we hadn't pre-listed."""
+        MDNS_ADDR = "224.0.0.251"
+        MDNS_PORT = 5353
+
+        # `_services._dns-sd._udp.local` is the standard "list all your
+        # advertised types" meta-query.
+        meta_query = "_services._dns-sd._udp.local"
+        # Seed list of common service types. The meta-query usually surfaces
+        # everything, but we keep a hand-picked list as a fallback (some
+        # responders historically suppress the meta-query while still answering
+        # direct probes — we have no specific device on this network confirmed
+        # to do that, but the cost of also sending these is trivial).
+        seed_service_types = [
+            "_http._tcp.local",
+            "_https._tcp.local",
+            "_hap._tcp.local",        # HomeKit
+            "_homekit._tcp.local",
+            "_airplay._tcp.local",
+            "_raop._tcp.local",       # AirPlay audio
+            "_spotify-connect._tcp.local",
+            "_googlecast._tcp.local",
+            "_printer._tcp.local",
+            "_ipp._tcp.local",
+            "_smb._tcp.local",
+            "_afpovertcp._tcp.local",
+            "_ssh._tcp.local",
+            "_sftp-ssh._tcp.local",
+            "_device-info._tcp.local",
+            "_sonos._tcp.local",
+            "_soco._tcp.local",
+        ]
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        sock.bind(("", MDNS_PORT))
+
+        # Join multicast group
+        mreq = struct.pack("4sl", socket.inet_aton(MDNS_ADDR), socket.INADDR_ANY)
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+        sock.setblocking(False)
+
+        # Track which service types we've already queried so meta-query
+        # discoveries trigger a single follow-up without re-asking.
+        self._mdns_queried_types: set[str] = set()
+        self._mdns_new_service_types: set[str] = set()
+
+        async def send_batch(qnames: list[str]):
+            """Send each query twice with a 0.3 s gap between passes —
+            matches the SSDP/WS-D retry pattern to survive lossy Wi-Fi
+            multicast. Runs as a background task while the main loop
+            drains responses in parallel."""
+            pkts = [self._build_mdns_query(q) for q in qnames]
+            for _ in range(2):
+                for pkt in pkts:
+                    try:
+                        sock.sendto(pkt, (MDNS_ADDR, MDNS_PORT))
+                    except OSError:
+                        pass
+                await asyncio.sleep(0.3)
+
+        initial_queries = [meta_query] + list(seed_service_types)
+        for q in initial_queries:
+            self._mdns_queried_types.add(q)
+        initial_task = asyncio.create_task(send_batch(initial_queries))
+
+        # First half of the window: collect responses to seed + meta queries.
+        # Then send follow-ups for any *new* service types we learned about
+        # via the meta-query. Then collect for the remaining time.
+        loop = asyncio.get_running_loop()
+        midpoint = loop.time() + (timeout / 2)
+        end_time = loop.time() + timeout
+
+        async def drain_until(deadline: float):
+            while loop.time() < deadline:
+                try:
+                    data, addr = sock.recvfrom(4096)
+                    self._parse_mdns_response(data, addr[0])
+                except BlockingIOError:
+                    await asyncio.sleep(0.1)
+                except OSError:
+                    # Transient receive error (e.g. ICMP unreachable, interface
+                    # flap) — keep draining instead of aborting the scan.
+                    await asyncio.sleep(0.1)
+
+        await drain_until(midpoint)
+
+        follow_ups = [
+            st for st in self._mdns_new_service_types
+            if st not in self._mdns_queried_types
+        ]
+        for st in follow_ups:
+            self._mdns_queried_types.add(st)
+        self._mdns_new_service_types.clear()
+        follow_up_task = (
+            asyncio.create_task(send_batch(follow_ups)) if follow_ups else None
+        )
+
+        await drain_until(end_time)
+
+        # Both send tasks are bounded (~0.6 s total) and almost always done by
+        # now, but await them to ensure no pending sendto fires after close.
+        await initial_task
+        if follow_up_task:
+            await follow_up_task
+
+        sock.close()
+
+    def _build_mdns_query(self, name: str) -> bytes:
+        """Build a simple mDNS PTR query."""
+        # Header: ID=0, Flags=0, QDCOUNT=1, others=0
+        header = struct.pack(">HHHHHH", 0, 0, 1, 0, 0, 0)
+
+        # Question section
+        question = b""
+        for part in name.split("."):
+            question += bytes([len(part)]) + part.encode()
+        question += b"\x00"  # End of name
+        question += struct.pack(">HH", 12, 1)  # Type PTR, Class IN
+
+        return header + question
+
+    def _parse_mdns_response(self, data: bytes, addr: str):
+        """Parse an mDNS response and extract device info from every section.
+
+        Most responses ride SRV/TXT/A records in the ADDITIONAL section
+        (alongside the PTR in ANSWER), so we walk all three sections — answer,
+        authority, additional — and treat the records identically."""
+        try:
+            if len(data) < 12:
+                return
+            qdcount, ancount, nscount, arcount = struct.unpack(">HHHH", data[4:12])
+            offset = 12
+
+            # Skip questions
+            for _ in range(qdcount):
+                _, offset = self._read_name(data, offset)
+                offset += 4  # QTYPE + QCLASS
+
+            for _ in range(ancount + nscount + arcount):
+                if offset >= len(data):
+                    break
+
+                name, offset = self._read_name(data, offset)
+                if offset + 10 > len(data):
+                    break
+
+                rtype, rclass, ttl, rdlen = struct.unpack(">HHIH", data[offset:offset + 10])
+                offset += 10
+                if offset + rdlen > len(data):
+                    break
+
+                rdata_start = offset
+                rdata_end = offset + rdlen
+
+                if rtype == 1 and rdlen == 4:  # A
+                    ip = ".".join(str(b) for b in data[rdata_start:rdata_end])
+                    if name.endswith(".local"):
+                        hostname = name[:-len(".local")]
+                        if hostname:
+                            device = self.add_device(ip, source="mdns")
+                            if not device.mdns_a_name:
+                                device.mdns_a_name = hostname
+
+                elif rtype == 12:  # PTR
+                    target, _ = self._read_name(data, rdata_start)
+                    bare = name.rstrip(".")
+
+                    # Meta-query response: rdata target is a service type to
+                    # follow up on later in this scan window.
+                    if bare == "_services._dns-sd._udp.local":
+                        if target and target not in self._mdns_queried_types:
+                            self._mdns_new_service_types.add(target)
+                    # Service-type PTRs (and their `<X>._sub.` subtype variants)
+                    # always end in `._tcp.local` or `._udp.local`. Anything
+                    # else — most commonly reverse-DNS PTRs `*.in-addr.arpa`
+                    # and `*.ip6.arpa` that macOS announces per RFC 6762 §11
+                    # — is not a service announcement, even though it's also
+                    # carried as a PTR record.
+                    elif bare.endswith("._tcp.local") or bare.endswith("._udp.local"):
+                        service_type = clean_mdns_service(name)
+                        if service_type:
+                            self.add_device(addr, service=service_type, source="mdns")
+                        self._extract_from_mdns_instance(target, addr)
+
+                elif rtype == 33 and rdlen >= 6:  # SRV
+                    target, _ = self._read_name(data, rdata_start + 6)
+                    if target.endswith(".local"):
+                        hostname = target[:-len(".local")]
+                        if hostname and not _looks_like_uuid_or_mac(hostname):
+                            device = self.add_device(addr, source="mdns")
+                            if not device.mdns_srv_name:
+                                device.mdns_srv_name = hostname
+
+                elif rtype == 16 and rdlen > 0:  # TXT
+                    txt_records = self._parse_txt_record(data[rdata_start:rdata_end])
+                    if txt_records and addr in self.devices:
+                        self.devices[addr].txt_records.update(txt_records)
+
+                offset = rdata_end
+
+        except Exception:
+            pass  # Ignore malformed responses
+
+    def _extract_from_mdns_instance(self, instance: str, addr: str):
+        """Extract metadata from a service instance name.
+
+        Apple's `_apple-mobdev2._tcp` PTR instance name embeds the device's real
+        Apple-OUI MAC (e.g. `fc:47:d8:b9:1a:39@fe80::...`) even when the device
+        is using a randomized MAC at the L2 layer. We capture that as leaked
+        metadata without overwriting the actual ARP-layer MAC.
+
+        Also extracts a friendly device name from the instance name prefix
+        when it doesn't look like a UUID or bare MAC identifier."""
+        if not instance or addr not in self.devices:
+            return
+        device = self.devices[addr]
+
+        # Embedded MAC (e.g. `fc:47:d8:b9:1a:39@...`)
+        for m in _MAC_PATTERN.finditer(instance):
+            mac = m.group(1).upper()
+            if mac != (device.mac_address or "").upper():
+                registrant = lookup_oui_registrant(mac) or ""
+                # Don't overwrite a richer registrant with an empty one
+                if mac not in device.leaked_macs or registrant:
+                    device.leaked_macs[mac] = registrant
+
+        # Friendly name from the instance-name prefix, RAOP-style `MAC@Name`,
+        # but skip pure UUIDs (e.g. _remotepairing) and MAC-only prefixes.
+        if "._" in instance:
+            prefix = instance.split("._", 1)[0]
+            if "@" in prefix:
+                after = prefix.split("@", 1)[1]
+                if after and not _looks_like_uuid_or_mac(after):
+                    if not device.mdns_instance_name:
+                        device.mdns_instance_name = after
+            elif prefix and not _looks_like_uuid_or_mac(prefix):
+                if not device.mdns_instance_name:
+                    device.mdns_instance_name = prefix
+
+    def _parse_txt_record(self, data: bytes) -> dict[str, str]:
+        """Parse TXT record data into key=value pairs."""
+        records = {}
+        pos = 0
+        while pos < len(data):
+            length = data[pos]
+            if length == 0:
+                break
+            pos += 1
+            if pos + length > len(data):
+                break
+            txt_str = data[pos:pos + length].decode("utf-8", errors="ignore")
+            pos += length
+            # Parse key=value format
+            if "=" in txt_str:
+                key, value = txt_str.split("=", 1)
+                records[key] = value
+            else:
+                # Some TXT records are just flags without values
+                records[txt_str] = ""
+        return records
+
+    def _read_name(self, data: bytes, offset: int) -> tuple[str, int]:
+        """Read a DNS name with compression support."""
+        parts = []
+        visited = set()
+
+        while offset < len(data):
+            if offset in visited:
+                break
+            visited.add(offset)
+
+            length = data[offset]
+            if length == 0:
+                offset += 1
+                break
+            elif length & 0xC0 == 0xC0:
+                pointer = struct.unpack(">H", data[offset:offset + 2])[0] & 0x3FFF
+                name, _ = self._read_name(data, pointer)
+                parts.append(name)
+                offset += 2
+                break
+            else:
+                offset += 1
+                parts.append(data[offset:offset + length].decode("utf-8", errors="ignore"))
+                offset += length
+
+        return ".".join(parts), offset
+
+    async def discover_ssdp(self, timeout: float = 3.0):
+        """Discover devices via SSDP (UPnP)."""
+        SSDP_ADDR = "239.255.255.250"
+        SSDP_PORT = 1900
+
+        # ssdp:all surfaces most UPnP/DIAL devices, but some only answer the
+        # narrower upnp:rootdevice query — per netdisco's ssdp.py: "Devices
+        # only, some devices will only respond to this query."
+        # https://github.com/home-assistant-libs/netdisco/blob/master/netdisco/ssdp.py
+        # LOCATION URLs from each response drive the description fetch below.
+        search_targets = ["ssdp:all", "upnp:rootdevice"]
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.setblocking(False)
+
+        # Send each M-SEARCH twice with a small gap — multicast on home Wi-Fi
+        # is lossy, and a single dropped packet would silently lose a device.
+        async def send_searches():
+            for _ in range(2):
+                for st in search_targets:
+                    message = (
+                        "M-SEARCH * HTTP/1.1\r\n"
+                        f"HOST: {SSDP_ADDR}:{SSDP_PORT}\r\n"
+                        "MAN: \"ssdp:discover\"\r\n"
+                        "MX: 2\r\n"
+                        f"ST: {st}\r\n"
+                        "\r\n"
+                    )
+                    sock.sendto(message.encode(), (SSDP_ADDR, SSDP_PORT))
+                await asyncio.sleep(0.3)
+
+        send_task = asyncio.create_task(send_searches())
+        loop = asyncio.get_running_loop()
+        end_time = loop.time() + timeout
+        while loop.time() < end_time:
+            try:
+                data, addr = sock.recvfrom(4096)
+                self._parse_ssdp_response(data.decode("utf-8", errors="ignore"), addr[0])
+            except BlockingIOError:
+                await asyncio.sleep(0.1)
+            except OSError:
+                # Transient receive error — keep draining.
+                await asyncio.sleep(0.1)
+
+        await send_task
+        sock.close()
+
+    async def discover_wsd(self, timeout: float = 3.0):
+        """Discover devices via WS-Discovery (multicast SOAP probe on UDP 3702).
+
+        Fills a coverage gap left by SSDP/mDNS: ONVIF IP cameras, modern Windows
+        PCs, and many networked printers/scanners advertise here but not on the
+        other multicast protocols. We send a generic Probe (matches any Type)
+        and parse ProbeMatch responses for the device's Types + endpoint URLs."""
+        WSD_ADDR = "239.255.255.250"
+        WSD_PORT = 3702
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.setblocking(False)
+
+        import uuid
+        msg_id = f"uuid:{uuid.uuid4()}"
+        probe = (
+            '<?xml version="1.0" encoding="utf-8"?>'
+            '<soap:Envelope '
+            'xmlns:soap="http://www.w3.org/2003/05/soap-envelope" '
+            'xmlns:wsa="http://schemas.xmlsoap.org/ws/2004/08/addressing" '
+            'xmlns:wsd="http://schemas.xmlsoap.org/ws/2005/04/discovery">'
+            '<soap:Header>'
+            '<wsa:To>urn:schemas-xmlsoap-org:ws:2005:04:discovery</wsa:To>'
+            '<wsa:Action>http://schemas.xmlsoap.org/ws/2005/04/discovery/Probe</wsa:Action>'
+            f'<wsa:MessageID>{msg_id}</wsa:MessageID>'
+            '</soap:Header>'
+            '<soap:Body><wsd:Probe/></soap:Body>'
+            '</soap:Envelope>'
+        ).encode()
+
+        async def send_probes():
+            # Multicast on Wi-Fi is lossy; send twice (matches SSDP / mDNS).
+            for _ in range(2):
+                try:
+                    sock.sendto(probe, (WSD_ADDR, WSD_PORT))
+                except OSError:
+                    pass
+                await asyncio.sleep(0.3)
+
+        send_task = asyncio.create_task(send_probes())
+        loop = asyncio.get_running_loop()
+        end_time = loop.time() + timeout
+        while loop.time() < end_time:
+            try:
+                data, addr = sock.recvfrom(8192)
+                self._parse_wsd_response(data.decode("utf-8", errors="ignore"), addr[0])
+            except BlockingIOError:
+                await asyncio.sleep(0.1)
+            except OSError:
+                await asyncio.sleep(0.1)
+
+        await send_task
+        sock.close()
+
+    # WS-D Types and XAddrs come back as whitespace-separated lists inside
+    # element tags whose namespace prefix varies (wsd:, d:, tns:). We match
+    # by local-name only.
+    _WSD_TYPES_RE = re.compile(r"<(?:[\w-]+:)?Types[^>]*>([^<]+)</(?:[\w-]+:)?Types>", re.DOTALL)
+    _WSD_XADDRS_RE = re.compile(r"<(?:[\w-]+:)?XAddrs[^>]*>([^<]+)</(?:[\w-]+:)?XAddrs>", re.DOTALL)
+    # The device's logical endpoint reference — the first <Address> nested in an
+    # <EndpointReference> (the device's, not the header's To/ReplyTo). This is
+    # the correct wsa:To for a follow-up WS-Transfer Get.
+    _WSD_EPR_RE = re.compile(
+        r"<(?:[\w-]+:)?EndpointReference\b.*?<(?:[\w-]+:)?Address[^>]*>([^<]+)</(?:[\w-]+:)?Address>",
+        re.DOTALL,
+    )
+
+    def _parse_wsd_response(self, body: str, addr: str):
+        """Extract Types and XAddrs from a WS-D ProbeMatch / Hello envelope.
+
+        Any well-formed WS-D envelope is recorded in provenance even if it
+        carries neither Types nor XAddrs — the UI surfaces 'we asked and got
+        a reply' separately from 'we got useful metadata back'."""
+        if "Envelope" not in body:
+            return  # not a WS-D message
+
+        self.add_device(addr, source="wsd")
+        device = self.devices[addr]
+
+        m = self._WSD_TYPES_RE.search(body)
+        if m:
+            for t in m.group(1).split():
+                device.wsd_services.add(t)
+        m = self._WSD_XADDRS_RE.search(body)
+        if m:
+            for x in m.group(1).split():
+                device.wsd_xaddrs.add(x)
+        if not device.wsd_endpoint_ref:
+            m = self._WSD_EPR_RE.search(body)
+            if m:
+                device.wsd_endpoint_ref = m.group(1).strip()
+
+    def _parse_ssdp_response(self, response: str, addr: str):
+        """Parse an SSDP M-SEARCH response."""
+        lines = response.split("\r\n")
+        service = None
+        location = None
+
+        for line in lines:
+            lower = line.lower()
+            if lower.startswith("location:"):
+                location = line.split(":", 1)[1].strip()
+            elif lower.startswith("st:"):
+                target = line.split(":", 1)[1].strip()
+                # Vendor-specific STs the URN parser below would miss
+                if target == "roku:ecp":
+                    service = "roku-ecp"
+                # Extract service type from URN
+                elif ":" in target:
+                    parts = target.split(":")
+                    for i, p in enumerate(parts):
+                        if p in ("device", "service") and i + 1 < len(parts):
+                            service = parts[i + 1]
+                            break
+
+        device = self.add_device(addr, service=service, source="ssdp")
+        if location and device is not None:
+            device.location_urls.add(location)
+
+    async def fetch_device_descriptions(self):
+        """Fetch UPnP device descriptions from LOCATION URLs collected during SSDP discovery."""
+        tasks = []
+        for device in self.devices.values():
+            tasks.append(self._fetch_description(device))
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    # WS-Transfer Get action — the DPWS "fetch your metadata" request.
+    _WSD_GET_ACTION = "http://schemas.xmlsoap.org/ws/2004/09/transfer/Get"
+
+    async def enrich_wsd(self):
+        """Resolve DPWS device metadata from the WS-Discovery XAddr endpoints
+        collected during discovery. A WS-Transfer Get to each XAddr returns the
+        device's ThisModel (Manufacturer/ModelName) and ThisDevice
+        (FriendlyName) — the Windows/printer/camera analog of the UPnP
+        description fetch, reusing endpoints we already discovered."""
+        tasks = [
+            self._fetch_wsd_metadata(d)
+            for d in self.devices.values()
+            if d.wsd_xaddrs
+        ]
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    def _build_wsd_get(self, to: str) -> bytes:
+        """Build a WS-Transfer Get SOAP 1.2 envelope addressed to `to`."""
+        msg_id = f"urn:uuid:{uuid.uuid4()}"
+        anon = "http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous"
+        envelope = (
+            '<?xml version="1.0" encoding="utf-8"?>'
+            '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"'
+            ' xmlns:a="http://schemas.xmlsoap.org/ws/2004/08/addressing">'
+            '<s:Header>'
+            f'<a:To>{to}</a:To>'
+            f'<a:Action>{self._WSD_GET_ACTION}</a:Action>'
+            f'<a:MessageID>{msg_id}</a:MessageID>'
+            f'<a:ReplyTo><a:Address>{anon}</a:Address></a:ReplyTo>'
+            '</s:Header><s:Body/></s:Envelope>'
+        )
+        return envelope.encode("utf-8")
+
+    async def _fetch_wsd_metadata(self, device: Device):
+        """POST a WS-Transfer Get to each XAddr and scrape DPWS ThisModel /
+        ThisDevice metadata. Stops at the first endpoint that yields a model or
+        friendly name. wsa:To is the device's endpoint reference when we
+        captured one, else the transport URL (tolerated by most stacks)."""
+        for xaddr in sorted(device.wsd_xaddrs):
+            try:
+                parsed = urlparse(xaddr)
+                host = parsed.hostname
+                port = parsed.port or (443 if parsed.scheme == "https" else 80)
+                path = parsed.path or "/"
+                if parsed.query:
+                    path = f"{path}?{parsed.query}"
+                if not host:
+                    continue
+                envelope = self._build_wsd_get(device.wsd_endpoint_ref or xaddr)
+                body = await self._http_post(
+                    host, port, path, envelope,
+                    "application/soap+xml; charset=utf-8",
+                    is_https=(parsed.scheme == "https"),
+                )
+            except Exception:
+                continue
+            if not body or b"Envelope" not in body:
+                continue
+            text = body.decode("utf-8", errors="ignore")
+            if not device.wsd_manufacturer:
+                device.wsd_manufacturer = _xml_first_localname(text, "Manufacturer")
+            if not device.wsd_model:
+                device.wsd_model = _xml_first_localname(text, "ModelName")
+            if not device.wsd_friendly_name:
+                device.wsd_friendly_name = _xml_first_localname(text, "FriendlyName")
+            if device.wsd_model or device.wsd_friendly_name:
+                return
+
+    async def enrich_roku(self):
+        """For devices that look like Rokus, fetch /query/device-info via ECP."""
+        tasks = []
+        for device in self.devices.values():
+            if self._looks_like_roku(device):
+                tasks.append(self._fetch_roku_ecp(device))
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    @staticmethod
+    def _looks_like_roku(device: Device) -> bool:
+        """Roku self-identifies via the 'roku:ecp' SSDP ST; OUI is the fallback."""
+        if "roku-ecp" in device.services:
+            return True
+        if device.oui_registrant and "roku" in device.oui_registrant.lower():
+            return True
+        return False
+
+    async def _fetch_roku_ecp(self, device: Device):
+        """Fetch the Roku ECP /query/device-info XML and merge fields."""
+        try:
+            body = await self._http_get(device.address, 8060, "/query/device-info")
+        except Exception:
+            return
+        if not body or b"<device-info" not in body:
+            return
+        try:
+            text = body.decode("utf-8", errors="ignore")
+            root = ET.fromstring(text)
+        except ET.ParseError:
+            return
+        for child in root:
+            if child.text and child.text.strip():
+                device.roku_info[child.tag] = child.text.strip()
+        friendly = device.roku_info.get("user-device-name") or device.roku_info.get("friendly-device-name")
+        if friendly:
+            device.roku_friendly_name = friendly
+        model = device.roku_info.get("friendly-model-name") or device.roku_info.get("model-name")
+        if model and not device.model:
+            device.model = model
+
+    async def enrich_hue(self):
+        """For devices that look like Philips Hue bridges, fetch the unauthenticated
+        `/api/config` JSON. Returns bridge metadata (model, firmware, API version,
+        bridge ID, MAC, etc.) without needing an API key."""
+        tasks = []
+        for device in self.devices.values():
+            if self._looks_like_hue(device):
+                tasks.append(self._fetch_hue_config(device))
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    @staticmethod
+    def _looks_like_hue(device: Device) -> bool:
+        """Hue bridges advertise `_hue._tcp` via mDNS; OUI ('Philips Lighting'
+        / 'Signify') is the fallback."""
+        if "hue" in device.mdns_services:
+            return True
+        if device.oui_registrant:
+            registrant = device.oui_registrant.lower()
+            if "philips lighting" in registrant or "signify" in registrant:
+                return True
+        return False
+
+    async def _fetch_hue_config(self, device: Device):
+        try:
+            body = await self._http_get(device.address, 80, "/api/config")
+        except Exception:
+            return
+        if not body:
+            return
+        try:
+            data = json.loads(body.decode("utf-8", errors="ignore"))
+        except (ValueError, UnicodeDecodeError):
+            return
+        if not isinstance(data, dict):
+            return
+        # Hue returns plenty of scalar metadata at the top level; skip nested
+        # objects (whitelist, swupdate state) that don't render cleanly as a
+        # flat key/value table.
+        for key, value in data.items():
+            if isinstance(value, (str, int, bool)):
+                device.hue_info[key] = str(value)
+
+    # Service signals that mark a device as a printer worth an IPP query.
+    _PRINTER_MDNS_SERVICES = {"ipp", "ipps", "ipp-tls", "printer", "pdl-datastream"}
+
+    @classmethod
+    def _looks_like_printer(cls, device: Device) -> bool:
+        """A printer is anything advertising an IPP/printer mDNS service, a WSD
+        print device type, or simply listening on the IPP port (631) — the last
+        catches printers that are silent on mDNS but still answer IPP."""
+        if device.mdns_services & cls._PRINTER_MDNS_SERVICES:
+            return True
+        if "wprt:PrintDeviceType" in device.wsd_services:
+            return True
+        if device.http_probe_results.get(631) == "ok" or 631 in device.http_banners:
+            return True
+        return False
+
+    async def enrich_ipp(self):
+        """Query printers for IPP Get-Printer-Attributes. Adds the model for
+        mDNS-silent printers and the admin-set printer-info/-location that have
+        no mDNS equivalent. Runs after the HTTP banner probe so the port-631
+        signal in _looks_like_printer is available."""
+        tasks = [
+            self._fetch_ipp_attributes(d)
+            for d in self.devices.values()
+            if self._looks_like_printer(d)
+        ]
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _fetch_ipp_attributes(self, device: Device):
+        """POST Get-Printer-Attributes to the printer and record the few
+        naming/status fields we asked for. The queue path comes from the mDNS
+        'rp' key when present, else the IPP Everywhere default of /ipp/print.
+        Tries plain IPP on 631 first, then implicit-TLS ipps on 631."""
+        rp = (device.txt_records.get("rp") or "ipp/print").lstrip("/")
+        path = "/" + rp
+        for port, https in ((631, False), (631, True)):
+            scheme = "ipps" if https else "ipp"
+            printer_uri = f"{scheme}://{device.address}:{port}{path}"
+            try:
+                body = await self._http_post(
+                    device.address, port, path,
+                    _build_ipp_get_printer_attributes(printer_uri),
+                    "application/ipp", is_https=https,
+                )
+            except Exception:
+                continue
+            attrs = _parse_ipp_response(body or b"")
+            if not attrs:
+                continue
+
+            def first(name):
+                vals = attrs.get(name)
+                return vals[0] if vals else None
+
+            mm = first("printer-make-and-model")
+            info = first("printer-info")
+            if isinstance(mm, str) and mm.strip():
+                device.ipp_make_and_model = mm.strip()
+            if isinstance(info, str) and info.strip():
+                device.ipp_info = info.strip()
+            # Flat snapshot for the detail view; render the state enum as a word.
+            for name in ("printer-make-and-model", "printer-info",
+                         "printer-location", "printer-state", "printer-state-reasons"):
+                vals = attrs.get(name)
+                if not vals:
+                    continue
+                if name == "printer-state":
+                    rendered = [_IPP_PRINTER_STATES.get(v, str(v)) for v in vals]
+                else:
+                    rendered = [str(v) for v in vals]
+                device.ipp_attrs[name] = ", ".join(r for r in rendered if r)
+            if device.ipp_attrs:
+                return
+
+    async def enrich_netbios(self, timeout: float = 0.5):
+        """Send a NetBIOS Node Status query (NBSTAT) to every known device.
+
+        Useful for naming Windows PCs, NAS units, and older printers that
+        don't speak mDNS. Each query is a single unicast UDP packet to port
+        137 — silent on devices that don't run NBNS, and very informative
+        on the ones that do."""
+        tasks = [self._query_netbios(d, timeout) for d in list(self.devices.values())]
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    @staticmethod
+    def _encode_netbios_name(name: bytes) -> bytes:
+        """Encode a 16-byte raw NetBIOS name into its 32-byte wire form.
+        Each byte is split into two nibbles, each added to 0x41 ('A')."""
+        out = bytearray()
+        for b in name:
+            out.append(0x41 + (b >> 4))
+            out.append(0x41 + (b & 0xF))
+        return bytes(out)
+
+    async def _query_netbios(self, device: Device, timeout: float):
+        """Send NBSTAT (qtype 0x21) for the wildcard name '*' and parse the reply."""
+        # Wildcard name: '*' + 15 NULs, encoded to 32 ASCII bytes ("CKAAAA...AAAA").
+        raw_name = b"*" + b"\x00" * 15
+        encoded = self._encode_netbios_name(raw_name)
+
+        # 12-byte DNS-style header: trxid=0x1234, flags=0, qd=1, others=0
+        header = struct.pack(">HHHHHH", 0x1234, 0, 1, 0, 0, 0)
+        # Question: length-prefixed encoded name (32) + null terminator + qtype + qclass
+        question = bytes([32]) + encoded + b"\x00" + struct.pack(">HH", 0x21, 0x0001)
+        query = header + question
+
+        loop = asyncio.get_running_loop()
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setblocking(False)
+        try:
+            try:
+                await loop.sock_sendto(sock, query, (device.address, 137))
+            except (AttributeError, NotImplementedError):
+                # sock_sendto is 3.11+; fall back to blocking send on the
+                # non-blocking socket (UDP sends complete immediately).
+                try:
+                    sock.sendto(query, (device.address, 137))
+                except OSError:
+                    return
+
+            try:
+                data = await asyncio.wait_for(loop.sock_recv(sock, 4096), timeout=timeout)
+            except (asyncio.TimeoutError, OSError):
+                return
+
+            self._parse_nbstat_response(data, device)
+        finally:
+            sock.close()
+
+    def _parse_nbstat_response(self, data: bytes, device: Device):
+        """Parse an NBSTAT reply: header → [question]* → answer RR → name list.
+
+        macOS smbd is RFC-noncompliant here: it responds with QDCOUNT=0 (no
+        echoed question section) instead of the typical QDCOUNT=1. We honor
+        the actual qdcount from the header rather than assuming a fixed shape."""
+        if len(data) < 12:
+            return
+        # Header: id(2), flags(2), qd(2), an(2), ns(2), ar(2)
+        qdcount, ancount = struct.unpack(">HH", data[4:8])
+        if ancount == 0:
+            return
+
+        offset = 12
+        # Skip whatever question sections are present (0 on macOS, 1 elsewhere)
+        for _ in range(qdcount):
+            _, offset = self._read_name(data, offset)
+            offset += 4  # qtype + qclass
+
+        # Answer RR: name + type(2) + class(2) + ttl(4) + rdlength(2) + rdata
+        _, offset = self._read_name(data, offset)
+        if offset + 10 > len(data):
+            return
+        offset += 10  # skip type/class/ttl/rdlength
+
+        if offset >= len(data):
+            return
+        num_names = data[offset]
+        offset += 1
+
+        # Any well-formed NBSTAT reply is worth recording — macOS, for example,
+        # responds with num_names=0 (no registered NetBIOS names) but the
+        # response itself confirms the host runs an NBNS service.
+        device.provenance.add("netbios")
+
+        workstation: Optional[str] = None
+        workgroup: Optional[str] = None
+
+        for _ in range(num_names):
+            if offset + 18 > len(data):
+                break
+            raw = data[offset:offset + 15].rstrip(b" \x00")
+            suffix = data[offset + 15]
+            flags = struct.unpack(">H", data[offset + 16:offset + 18])[0]
+            is_group = bool(flags & 0x8000)
+            offset += 18
+
+            # Restrict to ASCII printable; macOS smbd has been seen returning
+            # high-bit garbage in the workstation-name slot, and the unicode
+            # replacement character `�` passes Python's isprintable().
+            if not raw or not all(0x20 <= b <= 0x7E for b in raw):
+                continue
+            name = raw.decode("ascii")
+            # Suffix 0x00 = workstation service (unique) or workgroup (group).
+            # That's the one entry we care about for naming purposes.
+            if suffix == 0x00:
+                if is_group and not workgroup:
+                    workgroup = name
+                elif not is_group and not workstation:
+                    workstation = name
+
+        if workstation:
+            device.netbios_name = workstation
+        if workgroup:
+            device.netbios_workgroup = workgroup
+
+    # Ports probed by HTTP/HTTPS banner grab. Kept small on purpose — these
+    # are the well-trodden web-admin ports; expanding the list runs into
+    # diminishing returns and longer per-host probe time.
+    _HTTP_BANNER_PORTS: tuple[tuple[int, bool], ...] = (
+        (80, False),
+        (8080, False),
+        (8008, False),    # Chromecast / Cast web server
+        (631, False),     # IPP printer admin UI
+        (443, True),
+        (8443, True),
+    )
+
+    async def enrich_http_banners(self, timeout: float = 1.0):
+        """Probe a small set of HTTP/HTTPS ports on every device for Server
+        header and <title>. Skips ports already covered by an SSDP LOCATION URL
+        (same path, no point re-fetching)."""
+        sem = asyncio.Semaphore(50)
+
+        async def guarded(device: Device, port: int, is_https: bool):
+            async with sem:
+                await self._grab_http_banner(device, port, is_https, timeout)
+
+        tasks = []
+        for device in self.devices.values():
+            covered_ports = set()
+            for url in device.location_urls:
+                p = urlparse(url)
+                covered_ports.add(p.port or (443 if p.scheme == "https" else 80))
+            for port, is_https in self._HTTP_BANNER_PORTS:
+                if port in covered_ports:
+                    continue
+                tasks.append(guarded(device, port, is_https))
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _grab_http_banner(self, device: Device, port: int, is_https: bool, timeout: float):
+        """Open the port, send GET /, harvest Server header + <title>.
+
+        Always records a per-port outcome in device.http_probe_results
+        (closed / timeout / non-http / ok) so the device-details view can
+        report what actually happened on every port we tried."""
+        try:
+            if is_https:
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(device.address, port,
+                                            ssl=_unverified_tls_context()),
+                    timeout=timeout,
+                )
+            else:
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(device.address, port),
+                    timeout=timeout,
+                )
+        except asyncio.TimeoutError:
+            device.http_probe_results[port] = "timeout"
+            return
+        except Exception:
+            device.http_probe_results[port] = "closed"
+            return
+
+        try:
+            request = (
+                f"GET / HTTP/1.0\r\n"
+                f"Host: {device.address}\r\n"
+                f"User-Agent: lan-scan\r\n"
+                f"Accept: */*\r\n"
+                f"Connection: close\r\n\r\n"
+            )
+            try:
+                writer.write(request.encode())
+                await asyncio.wait_for(writer.drain(), timeout=timeout)
+            except Exception:
+                # Connected but couldn't send — treat like a TCP service
+                # that doesn't speak HTTP.
+                device.http_probe_results[port] = "non-http"
+                return
+
+            chunks: list[bytes] = []
+            total = 0
+            deadline = asyncio.get_running_loop().time() + timeout * 2
+            while True:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    break
+                try:
+                    chunk = await asyncio.wait_for(reader.read(4096), timeout=remaining)
+                except (asyncio.TimeoutError, Exception):
+                    break
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+                # Cap to keep memory bounded on devices that stream large pages.
+                if total > 65536:
+                    break
+
+            response = b"".join(chunks)
+            if not response:
+                device.http_probe_results[port] = "non-http"
+                return
+
+            header_blob, _, body = response.partition(b"\r\n\r\n")
+            header_text = header_blob.decode("iso-8859-1", errors="ignore")
+            lines = header_text.split("\r\n")
+            status_line = lines[0] if lines else ""
+
+            # Require something that resembles an HTTP status line, so we
+            # don't record a random TCP service that happens to write a few
+            # bytes on accept. "HTTP/" is the minimum signal.
+            if not status_line.startswith("HTTP/"):
+                device.http_probe_results[port] = "non-http"
+                return
+
+            banner: dict[str, str] = {}
+            try:
+                parts = status_line.split(maxsplit=2)
+                if len(parts) >= 2:
+                    banner["status"] = parts[1]
+            except (IndexError, ValueError):
+                pass
+
+            for line in lines[1:]:
+                if line.lower().startswith("server:"):
+                    banner["server"] = line.split(":", 1)[1].strip()[:200]
+                    break
+
+            if body:
+                body_text = body.decode("utf-8", errors="ignore")
+                m = re.search(r"<title[^>]*>([^<]+)</title>", body_text, re.IGNORECASE | re.DOTALL)
+                if m:
+                    title = m.group(1).strip()
+                    title = (title
+                             .replace("&amp;", "&")
+                             .replace("&lt;", "<")
+                             .replace("&gt;", ">")
+                             .replace("&quot;", '"')
+                             .replace("&#39;", "'"))
+                    title = " ".join(title.split())  # collapse whitespace
+                    if title:
+                        banner["title"] = title[:200]
+
+            # Record on any HTTP-shaped reply, even if the device only sent
+            # back a status line. "HTTP service exists on port X" is itself
+            # useful, even without Server header or page title.
+            device.http_banners[port] = banner
+            device.http_probe_results[port] = "ok"
+        finally:
+            try:
+                writer.close()
+            except Exception:
+                pass
+
+    async def _fetch_description(self, device: Device):
+        """Fetch and parse UPnP device description XML from LOCATION URLs
+        advertised in the device's SSDP responses."""
+        for url in device.location_urls:
+            try:
+                parsed = urlparse(url)
+                host = parsed.hostname
+                port = parsed.port or (443 if parsed.scheme == "https" else 80)
+                path = parsed.path or "/"
+                if parsed.query:
+                    path = f"{path}?{parsed.query}"
+                if not host:
+                    continue
+                body = await self._http_get(host, port, path)
+                if body and b"<" in body:
+                    self._parse_device_xml(device, url, body)
+            except Exception:
+                continue
+
+    async def _http_get(self, host: str, port: int, path: str) -> bytes:
+        """Simple HTTP GET returning response body."""
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port),
+            timeout=1.0,
+        )
+
+        request = f"GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+        writer.write(request.encode())
+        await writer.drain()
+
+        # Read until connection closes (we sent Connection: close)
+        chunks = []
+        try:
+            while True:
+                chunk = await asyncio.wait_for(reader.read(4096), timeout=2.0)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        except asyncio.TimeoutError:
+            pass
+        response = b"".join(chunks)
+        writer.close()
+
+        # Parse response body
+        parts = response.split(b"\r\n\r\n", 1)
+        body = parts[-1] if len(parts) > 1 else b""
+
+        # Handle chunked transfer encoding
+        if b"transfer-encoding: chunked" in parts[0].lower():
+            body = self._decode_chunked(body)
+
+        return body
+
+    async def _http_post(self, host: str, port: int, path: str,
+                         body: bytes, content_type: str,
+                         is_https: bool = False) -> bytes:
+        """Simple HTTP POST returning the response body. Mirrors _http_get's
+        connect/read/close + chunked-decode handling, with optional TLS for
+        https/ipps endpoints (certs unverified — see _unverified_tls_context)."""
+        ssl_ctx = _unverified_tls_context() if is_https else None
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port, ssl=ssl_ctx),
+            timeout=1.0,
+        )
+
+        head = (
+            f"POST {path} HTTP/1.1\r\n"
+            f"Host: {host}\r\n"
+            f"Content-Type: {content_type}\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            f"Connection: close\r\n\r\n"
+        ).encode()
+        writer.write(head + body)
+        await writer.drain()
+
+        chunks = []
+        try:
+            while True:
+                chunk = await asyncio.wait_for(reader.read(4096), timeout=2.0)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        except asyncio.TimeoutError:
+            pass
+        response = b"".join(chunks)
+        writer.close()
+
+        parts = response.split(b"\r\n\r\n", 1)
+        resp_body = parts[-1] if len(parts) > 1 else b""
+        if b"transfer-encoding: chunked" in parts[0].lower():
+            resp_body = self._decode_chunked(resp_body)
+        return resp_body
+
+    def _decode_chunked(self, data: bytes) -> bytes:
+        """Decode HTTP chunked transfer encoding."""
+        decoded = []
+        pos = 0
+        while pos < len(data):
+            # Find the end of the chunk size line
+            line_end = data.find(b"\r\n", pos)
+            if line_end == -1:
+                break
+            # Parse chunk size (hex)
+            try:
+                chunk_size = int(data[pos:line_end].split(b";")[0], 16)
+            except ValueError:
+                break
+            if chunk_size == 0:
+                break
+            # Extract chunk data
+            chunk_start = line_end + 2
+            chunk_end = chunk_start + chunk_size
+            if chunk_end > len(data):
+                decoded.append(data[chunk_start:])
+                break
+            decoded.append(data[chunk_start:chunk_end])
+            pos = chunk_end + 2  # Skip trailing \r\n
+        return b"".join(decoded)
+
+    def _parse_device_xml(self, device: Device, url: str, xml_data: bytes):
+        """Parse UPnP device description XML for friendly name and model."""
+        # Store raw XML for detail view — one entry per source URL since a
+        # single device may advertise several distinct LOCATIONs.
+        device.xml_data[url] = xml_data
+        try:
+            # Handle potential BOM or whitespace
+            xml_data = xml_data.strip()
+            if xml_data.startswith(b'\xef\xbb\xbf'):
+                xml_data = xml_data[3:]
+
+            root = ET.fromstring(xml_data)
+
+            # Extract namespace from root tag if present
+            namespaces = ["{urn:schemas-upnp-org:device-1-0}", ""]
+
+            friendly_name = None
+            model_name = None
+            room_name = None
+            device_type = None
+
+            # Try each namespace
+            for ns in namespaces:
+                # Look for device element
+                device_elem = root.find(f".//{ns}device")
+                if device_elem is not None:
+                    friendly_name = friendly_name or device_elem.findtext(f"{ns}friendlyName")
+                    model_name = model_name or device_elem.findtext(f"{ns}modelName")
+                    room_name = room_name or device_elem.findtext(f"{ns}roomName")
+                    device_type = device_type or device_elem.findtext(f"{ns}deviceType")
+
+            xml_str = xml_data.decode("utf-8", errors="ignore")
+
+            # Fallback: extract with simple string parsing if ET didn't find values
+            if not friendly_name:
+                match = re.search(r"<friendlyName>([^<]+)</friendlyName>", xml_str)
+                if match:
+                    friendly_name = match.group(1)
+            if not model_name:
+                match = re.search(r"<modelName>([^<]+)</modelName>", xml_str)
+                if match:
+                    model_name = match.group(1)
+            if not room_name:
+                match = re.search(r"<roomName>([^<]+)</roomName>", xml_str)
+                if match:
+                    room_name = match.group(1)
+            if not device_type:
+                match = re.search(r"<deviceType>([^<]+)</deviceType>", xml_str)
+                if match:
+                    device_type = match.group(1)
+
+            # Also look for manufacturer
+            manufacturer = None
+            for ns in namespaces:
+                device_elem = root.find(f".//{ns}device")
+                if device_elem is not None:
+                    manufacturer = device_elem.findtext(f"{ns}manufacturer")
+                    if manufacturer:
+                        break
+            if not manufacturer:
+                match = re.search(r"<manufacturer>([^<]+)</manufacturer>", xml_str)
+                if match:
+                    manufacturer = match.group(1)
+
+            # Apply values to the per-source name fields; resolve_name picks
+            # one at display time according to the documented priority list.
+            if friendly_name:
+                device.upnp_friendly_name = friendly_name
+            if room_name:
+                device.upnp_room_name = room_name
+            if manufacturer:
+                device.upnp_manufacturer = manufacturer
+            if model_name:
+                device.model = model_name
+            if device_type and not device.upnp_device_type:
+                device.upnp_device_type = device_type
+
+        except Exception:
+            pass
+
+    def populate_mac_addresses(self):
+        """Populate MAC addresses and registrants for all devices."""
+        self.arp_table = get_arp_table()
+        for device in self.devices.values():
+            if device.address in self.arp_table:
+                device.mac_address = self.arp_table[device.address]
+                device.oui_registrant = lookup_oui_registrant(device.mac_address)
+
+    def _get_local_ip(self) -> Optional[str]:
+        """Determine the local IP by opening a UDP socket to a public address.
+
+        No packets are actually sent — connect() on a UDP socket just selects
+        the route, which lets us read back the outbound interface address.
+        """
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.connect(("8.8.8.8", 80))
+            ip = sock.getsockname()[0]
+            sock.close()
+            return ip
+        except Exception:
+            return None
+
+    def _detect_subnet(self) -> Optional[tuple[str, str]]:
+        """Return (real_subnet, sweep_subnet) as CIDR strings, or None if the
+        local IP can't be determined.
+
+        real_subnet is the interface's actual network (for the status bar and
+        diff identity); its prefix is read from the OS interface table (via
+        `ip` on Linux or `ifconfig` on macOS/BSD), falling back to /24.
+
+        sweep_subnet is what the nmap ARP sweep targets: the same network, but
+        with the prefix floored at ARP_SWEEP_MAX_PREFIX so a wide mask collapses
+        to a /22-aligned window around the local IP rather than blasting tens of
+        thousands of mostly-unreachable ARP probes. Both are derived from a
+        single IP read so they stay consistent with each other.
+        """
+        local_ip = self._get_local_ip()
+        if not local_ip:
+            return None
+        prefix = self._get_local_prefixlen(local_ip)
+        if prefix is None:
+            prefix = 24
+        real = ipaddress.ip_network(f"{local_ip}/{prefix}", strict=False)
+        sweep = ipaddress.ip_network(
+            f"{local_ip}/{max(prefix, ARP_SWEEP_MAX_PREFIX)}", strict=False
+        )
+        return str(real), str(sweep)
+
+    def _get_local_subnet(self) -> Optional[str]:
+        """The interface's actual subnet in CIDR form (e.g. '192.168.1.0/24')."""
+        detected = self._detect_subnet()
+        return detected[0] if detected else None
+
+    def _arp_sweep_subnet(self) -> Optional[str]:
+        """The CIDR handed to the nmap ARP sweep (capped — see _detect_subnet).
+
+        This value is also baked into the sudoers NOPASSWD entry, so every call
+        site that builds the nmap command must go through here (or _detect_subnet)
+        or `sudo -n` won't match the command and the sweep fails."""
+        detected = self._detect_subnet()
+        return detected[1] if detected else None
+
+    def _get_local_prefixlen(self, local_ip: str) -> Optional[int]:
+        """Find the network prefix length for the interface that owns
+        ``local_ip`` by parsing the platform's interface listing. Returns
+        None if it can't be determined (caller falls back to /24)."""
+        # Linux: `ip -o -f inet addr show` → "... inet 192.168.1.23/24 ..."
+        ip_path = shutil.which("ip")
+        if ip_path:
+            try:
+                out = subprocess.run(
+                    [ip_path, "-o", "-f", "inet", "addr", "show"],
+                    capture_output=True, text=True, timeout=2.0,
+                ).stdout
+                m = re.search(rf"inet {re.escape(local_ip)}/(\d+)", out)
+                if m:
+                    return int(m.group(1))
+            except Exception:
+                pass
+        # macOS/BSD: `ifconfig` → "inet 192.168.1.23 netmask 0xffffff00 ..."
+        ifconfig_path = shutil.which("ifconfig")
+        if ifconfig_path:
+            try:
+                out = subprocess.run(
+                    [ifconfig_path], capture_output=True, text=True, timeout=2.0,
+                ).stdout
+                m = re.search(
+                    rf"inet {re.escape(local_ip)}\s+netmask\s+(\S+)", out
+                )
+                if m:
+                    return self._netmask_to_prefixlen(m.group(1))
+            except Exception:
+                pass
+        return None
+
+    @staticmethod
+    def _netmask_to_prefixlen(netmask: str) -> Optional[int]:
+        """Convert a netmask to a prefix length. Accepts both the hex form
+        BSD/macOS `ifconfig` prints (e.g. '0xffffff00') and dotted-quad
+        (e.g. '255.255.255.0'). Returns None if it can't be parsed."""
+        try:
+            if netmask.lower().startswith("0x"):
+                value = int(netmask, 16)
+            else:
+                value = int(ipaddress.IPv4Address(netmask))
+        except (ValueError, ipaddress.AddressValueError):
+            return None
+        prefix = bin(value).count("1")
+        # Reject non-contiguous masks (count of set bits wouldn't be meaningful).
+        if value != (((1 << prefix) - 1) << (32 - prefix)):
+            return None
+        return prefix
+
+    async def discover_arp(self) -> Optional[str]:
+        """Active ARP scan via `sudo -n nmap`.
+
+        Returns None on success, or a short reason string explaining why the
+        scan was skipped (so the caller can surface it to the user).
+        """
+        detected = self._detect_subnet()
+        if not detected:
+            self.subnet = None
+            return "no local subnet"
+        # self.subnet is the real subnet (TUI status bar / diff); nmap targets
+        # the possibly-capped sweep window — see _detect_subnet.
+        self.subnet, sweep = detected
+
+        nmap_path = shutil.which("nmap")
+        if not nmap_path:
+            return "nmap not installed (brew install nmap)"
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "sudo", "-n", nmap_path, "-sn", "-PR", "-oG", "-", sweep,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+        except Exception:
+            return "could not run sudo nmap"
+
+        # Scale the timeout with the swept subnet size: 10s for a /24 (or
+        # narrower), doubling per bit wider — e.g. /23 → 20s, /22 → 40s.
+        prefixlen = ipaddress.ip_network(sweep, strict=False).prefixlen
+        sweep_timeout = 10 * 2 ** max(0, 24 - prefixlen)
+
+        try:
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=sweep_timeout)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return "nmap timed out"
+
+        if proc.returncode != 0:
+            return "sudo not configured (run --setup-sudoers)"
+
+        # Greppable format: "Host: 192.168.1.1 (hostname)\tStatus: Up"
+        for line in stdout.decode("utf-8", errors="ignore").splitlines():
+            if not line.startswith("Host:") or "Status: Up" not in line:
+                continue
+            parts = line.split()
+            if len(parts) >= 2:
+                self.add_device(parts[1], source="arp")
+
+        # MACs/OUIs get populated centrally by populate_mac_addresses() after
+        # all discovery stages complete — nmap has already refreshed the kernel
+        # ARP cache by the time we return here.
+        return None
+
+    async def populate_rdns(self, timeout: float = 2.0):
+        """Run reverse DNS lookups for all devices in parallel."""
+        loop = asyncio.get_running_loop()
+
+        async def lookup(device: Device):
+            try:
+                name, _ = await asyncio.wait_for(
+                    loop.getnameinfo((device.address, 0), 0),
+                    timeout=timeout,
+                )
+                # getnameinfo returns the IP literal if no PTR exists
+                if name and name != device.address:
+                    device.rdns_name = name
+            except (asyncio.TimeoutError, socket.gaierror, OSError):
+                pass
+
+        await asyncio.gather(
+            *(lookup(d) for d in self.devices.values()),
+            return_exceptions=True,
+        )
+
+    async def discover(self, timeout: float = 3.0, on_progress: Optional[Callable[..., None]] = None):
+        """Run all discovery methods concurrently, reporting per-stage progress."""
+        def report(msg: str, key: Optional[str] = None, final: bool = False):
+            # key: when set, the consumer may rewrite the line with the same key
+            # in place (used for the live per-stage counters). final: marks the
+            # last update for a key, so plain-stdout consumers can skip the
+            # intermediate ticks and print only the settled line.
+            if on_progress:
+                on_progress(msg, key=key, final=final)
+
+        def count_by(*sources: str) -> int:
+            return sum(
+                1 for d in self.devices.values() if any(s in d.provenance for s in sources)
+            )
+
+        # The three multicast scans accrue devices into self.devices as packets
+        # arrive, so their counters can climb live; ARP is an external nmap
+        # sweep that lands all at once, so it just shows "..." until done.
+        # `done` keeps the ticker from clobbering a stage's settled final line.
+        live_stages = {"mDNS scan": ("mdns",), "SSDP scan": ("ssdp",),
+                       "WS-Discovery": ("wsd",)}
+        done: set[str] = set()
+
+        async def stage(label: str, coro, *sources: str):
+            start = time.monotonic()
+            await coro
+            elapsed = time.monotonic() - start
+            n = count_by(*sources)
+            done.add(label)
+            report(f"  {label:<22} {n:>3} {plural(n, 'host')}  ({elapsed:.1f}s)",
+                   key=label, final=True)
+
+        async def arp_stage():
+            start = time.monotonic()
+            skip_reason = await self.discover_arp()
+            elapsed = time.monotonic() - start
+            done.add("ARP scan")
+            if skip_reason:
+                report(f"  {'ARP scan':<22} skipped — {skip_reason}",
+                       key="ARP scan", final=True)
+            else:
+                n = count_by('arp')
+                report(f"  {'ARP scan':<22} {n:>3} {plural(n, 'host')}  ({elapsed:.1f}s)",
+                       key="ARP scan", final=True)
+
+        async def ticker():
+            """Poll device counts ~5×/s and rewrite each in-progress stage's
+            line. Pure UI sugar — it never touches discovery state."""
+            try:
+                while True:
+                    await asyncio.sleep(0.2)
+                    for label, sources in live_stages.items():
+                        if label in done:
+                            continue
+                        n = count_by(*sources)
+                        if n:
+                            report(f"  {label:<22} {n:>3} {plural(n, 'host')}...",
+                                   key=label)
+            except asyncio.CancelledError:
+                pass
+
+        report("Discovery:")
+        discovery_start = time.monotonic()
+        # Lay down all four stage lines up front (fixed row order) so the ticker
+        # has stable rows to rewrite as counts come in.
+        for label in ("mDNS scan", "SSDP scan", "WS-Discovery", "ARP scan"):
+            # Blank count + blank "hosts" so the "..." lands in the same column
+            # as the trailing dots of the live "N hosts..." line below.
+            report(f"  {label:<22} {'':>3} {'':<5}...", key=label)
+
+        ticker_task = asyncio.create_task(ticker())
+        try:
+            await asyncio.gather(
+                stage("mDNS scan", self.discover_mdns(timeout), "mdns"),
+                stage("SSDP scan", self.discover_ssdp(timeout), "ssdp"),
+                stage("WS-Discovery", self.discover_wsd(timeout), "wsd"),
+                arp_stage(),
+            )
+        finally:
+            ticker_task.cancel()
+            await ticker_task
+
+        total = len(self.devices)
+        report(f"  → {total} unique {plural(total, 'host')}  ({time.monotonic() - discovery_start:.1f}s)")
+
+        report("")
+        report("Enrichment:")
+
+        start = time.monotonic()
+        await self.fetch_device_descriptions()
+        described = sum(1 for d in self.devices.values() if d.xml_data)
+        report(f"  UPnP descriptions      {described:>3} fetched   ({time.monotonic() - start:.1f}s)")
+
+        start = time.monotonic()
+        await self.enrich_wsd()
+        wsd_n = sum(1 for d in self.devices.values()
+                    if d.wsd_model or d.wsd_friendly_name or d.wsd_manufacturer)
+        if wsd_n:
+            report(f"  WSD metadata           {wsd_n:>3} resolved  ({time.monotonic() - start:.1f}s)")
+
+        # Catch devices found via mDNS/SSDP that the arp sweep missed
+        # fill in vendors for MAC addresses before vendor-specific probes
+        self.populate_mac_addresses()
+
+        start = time.monotonic()
+        await self.enrich_roku()
+        roku_n = sum(1 for d in self.devices.values() if d.roku_info)
+        if roku_n:
+            report(f"  Roku ECP               {roku_n:>3} enriched  ({time.monotonic() - start:.1f}s)")
+
+        start = time.monotonic()
+        await self.enrich_hue()
+        hue_n = sum(1 for d in self.devices.values() if d.hue_info)
+        if hue_n:
+            report(f"  Hue /api/config        {hue_n:>3} enriched  ({time.monotonic() - start:.1f}s)")
+
+        start = time.monotonic()
+        await self.enrich_netbios()
+        nb_n = sum(1 for d in self.devices.values() if d.netbios_name or d.netbios_workgroup)
+        report(f"  NetBIOS names          {nb_n:>3} named     ({time.monotonic() - start:.1f}s)")
+
+        start = time.monotonic()
+        await self.enrich_http_banners()
+        http_n = sum(1 for d in self.devices.values() if d.http_banners)
+        report(f"  HTTP banners           {http_n:>3} gathered  ({time.monotonic() - start:.1f}s)")
+
+        # After HTTP banners so _looks_like_printer can use the port-631 signal.
+        start = time.monotonic()
+        await self.enrich_ipp()
+        ipp_n = sum(1 for d in self.devices.values() if d.ipp_attrs)
+        if ipp_n:
+            report(f"  IPP attributes         {ipp_n:>3} queried   ({time.monotonic() - start:.1f}s)")
+
+        start = time.monotonic()
+        await self.populate_rdns()
+        resolved = sum(1 for d in self.devices.values() if d.rdns_name)
+        report(f"  Reverse DNS            {resolved:>3} resolved  ({time.monotonic() - start:.1f}s)")
+
+    def print_results(self):
+        """Print discovered devices in a formatted table."""
+        print("\n" + "=" * 90)
+        print(f"{'ADDRESS':15} | {'DEVICE':40} | SERVICES")
+        print("-" * 90)
+
+        for device in sorted(self.devices.values(), key=lambda d: tuple(map(int, d.address.split(".")))):
+            print(device)
+
+        print("=" * 90)
+        print(f"Found {len(self.devices)} device(s)\n")
+
+
+# Folder icon used to mark <device> nodes in the UPnP tree. The renderer
+# uses presence of this glyph on a line to apply bold styling, so it must
+# be unique to device-node lines.
+UPNP_DEVICE_ICON = "\u2699\ufe0f"  # ⚙️ (gear U+2699 + emoji-presentation selector U+FE0F)
+# Lines starting with this byte get rendered with A_DIM (greyed). Used by the
+# probe-status block to fade out negative results so the eye snaps to the
+# rows with actual data.
+DIM_LINE_MARKER = "\x01"
+
+
+def _upnp_short(urn: str, kind: str) -> str:
+    """Extract short name from a UPnP URN, e.g.
+    urn:schemas-upnp-org:device:WANDevice:1 -> WANDevice."""
+    parts = (urn or "").split(":")
+    for i, p in enumerate(parts):
+        if p == kind and i + 1 < len(parts):
+            return parts[i + 1]
+    return urn or kind
+
+
+def _strip_xml_namespaces(root: ET.Element) -> None:
+    for elem in root.iter():
+        if "}" in elem.tag:
+            elem.tag = elem.tag.split("}", 1)[1]
+
+
+def _render_upnp_device(
+    elem: ET.Element,
+    lines: list[str],
+    prefix: str,
+    is_last: bool,
+    is_root: bool,
+) -> None:
+    """Recursively render a UPnP <device> node and its services/sub-devices."""
+    label = _upnp_short(elem.findtext("deviceType") or "", "device")
+    if is_root:
+        lines.append(f"{UPNP_DEVICE_ICON}  {label}")
+        # Root's connectors get a 1-cell leading space (via the connector
+        # itself) so the tree spine sits just inside column 0 rather than
+        # flush against it.
+        child_prefix = ""
+    else:
+        connector = " └── " if is_last else " ├── "
+        lines.append(f"{prefix}{connector}{UPNP_DEVICE_ICON}  {label}")
+        # 5-cell continuation matches the connector width (" ├── "), so
+        # the next level's connector lines up directly under this level's.
+        child_prefix = prefix + ("     " if is_last else " │   ")
+
+    service_list = elem.find("serviceList")
+    services = [s for s in service_list if s.tag == "service"] if service_list is not None else []
+
+    device_list = elem.find("deviceList")
+    sub_devices = [d for d in device_list if d.tag == "device"] if device_list is not None else []
+
+    total = len(services) + len(sub_devices)
+
+    for i, svc in enumerate(services):
+        last = (i == total - 1)
+        connector = " └── " if last else " ├── "
+        name = _upnp_short(svc.findtext("serviceType") or "", "service")
+        lines.append(f"{child_prefix}{connector}{name}")
+
+    for j, dev in enumerate(sub_devices):
+        last = (len(services) + j == total - 1)
+        _render_upnp_device(dev, lines, child_prefix, last, is_root=False)
+
+
+def format_xml(xml_data: bytes) -> list[str]:
+    """Format a UPnP device description XML for display.
+
+    Emits the root device's metadata (friendly name, manufacturer, etc.),
+    a blank line, then a hierarchical tree of nested <device>/<service>
+    elements. Device-node lines are prefixed with UPNP_DEVICE_ICON so the
+    renderer can render them in bold.
+    """
+    lines: list[str] = []
+    try:
+        xml_data = xml_data.strip()
+        if xml_data.startswith(b"\xef\xbb\xbf"):
+            xml_data = xml_data[3:]
+
+        root = ET.fromstring(xml_data)
+        _strip_xml_namespaces(root)
+
+        root_device = root.find("device")
+        if root_device is None:
+            return ["(no <device> element in description)"]
+
+        # Render every text-bearing scalar child of <device> in document order,
+        # using the raw schema tag names. The UPnP Device Description schema is
+        # well-defined enough — and the extension-point convention loose enough
+        # — that vendor extras like Sonos's `roomName`, `displayVersion`,
+        # `swGen`, `internalSpeakerSize` land alongside the standard elements;
+        # iterating gets them all without a per-vendor allow-list. Container
+        # elements (serviceList, deviceList, iconList) have no direct text so
+        # are filtered out naturally.
+        for child in root_device:
+            if child.text and child.text.strip():
+                lines.append(f"{child.tag}: {child.text.strip()}")
+
+        if lines:
+            lines.append("")
+
+        _render_upnp_device(root_device, lines, prefix="", is_last=True, is_root=True)
+
+    except Exception as e:
+        lines.append(f"Error parsing XML: {e}")
+        try:
+            raw = xml_data.decode("utf-8", errors="ignore")
+            for line in raw.split("\n")[:50]:
+                lines.append(line.rstrip())
+        except Exception:
+            pass
+
+    return lines
+
+
+def _format_probe_status(device: Device) -> list[str]:
+    """One-line-per-probe status block for the device-details popup.
+
+    Reports, for every probe type the scanner runs:
+      - whether the probe was eligible / attempted
+      - what came back (counts) or why it returned nothing
+
+    Replaces the older `Discovered via:` / `Also replied to:` split and the
+    `Checked: ...` fallback — both of which only surfaced partial status.
+    """
+    lines: list[str] = []
+
+    def add(label: str, status: str, dim: bool = False):
+        # 12-char column fits the longest label ("HTTP banners" / "WS-Discovery").
+        # The leading DIM_LINE_MARKER tells the renderer to draw this row with
+        # A_DIM so negative/uninteresting probe results fade visually.
+        prefix = DIM_LINE_MARKER if dim else ""
+        lines.append(f"{prefix}  {label:<12} : {status}")
+
+    # ARP — active sweep via `sudo nmap -sn -PR <subnet>`. If the device
+    # responded to the unicast ARP probe it shows up here; otherwise it was
+    # found by one of the other discovery protocols (or the ARP sweep was
+    # skipped because nmap/sudo weren't configured).
+    if "arp" in device.provenance:
+        add("ARP", "responded")
+    else:
+        add("ARP", "no response", dim=True)
+
+    # mDNS — multicast discovery is always sent; per-host TXT queries follow.
+    if "mdns" in device.provenance:
+        bits: list[str] = []
+        if device.mdns_services:
+            n = len(device.mdns_services)
+            bits.append(f"{n} {plural(n, 'service')}")
+        if device.txt_records:
+            n = len(device.txt_records)
+            bits.append(f"{n} TXT {plural(n, 'record')}")
+        add("mDNS", ", ".join(bits) if bits else "replied, no services or TXT records")
+    else:
+        add("mDNS", "no response", dim=True)
+
+    # SSDP / UPnP — multicast M-SEARCH, then per-LOCATION-URL XML fetch.
+    if "ssdp" in device.provenance:
+        bits = []
+        if device.ssdp_services:
+            n = len(device.ssdp_services)
+            bits.append(f"{n} {plural(n, 'service')}")
+        if device.location_urls:
+            n_urls = len(device.location_urls)
+            n_fetched = len(device.xml_data)
+            fetched = f"{n_fetched}/{n_urls} fetched" if n_fetched else "none fetched"
+            bits.append(f"{n_urls} LOCATION {plural(n_urls, 'URL')} ({fetched})")
+        add("SSDP", ", ".join(bits) if bits else "replied, no services or LOCATION URLs")
+    else:
+        add("SSDP", "no response", dim=True)
+
+    # WS-Discovery — multicast probe, optional response with Types + XAddrs.
+    if "wsd" in device.provenance:
+        bits = []
+        if device.wsd_services:
+            n = len(device.wsd_services)
+            bits.append(f"{n} {plural(n, 'type')}")
+        if device.wsd_xaddrs:
+            n = len(device.wsd_xaddrs)
+            bits.append(f"{n} {plural(n, 'endpoint')}")
+        if device.wsd_model or device.wsd_friendly_name or device.wsd_manufacturer:
+            bits.append("metadata resolved")
+        elif device.wsd_xaddrs:
+            bits.append("metadata query empty")
+        add("WS-Discovery", ", ".join(bits) if bits else "replied, no types or endpoints")
+    else:
+        add("WS-Discovery", "no response", dim=True)
+
+    # NetBIOS — always queried per-device. A valid NBSTAT reply may register
+    # names or be empty (macOS smbd does the latter).
+    if "netbios" in device.provenance:
+        bits = []
+        if device.netbios_name:
+            bits.append(f"name={device.netbios_name}")
+        if device.netbios_workgroup:
+            bits.append(f"workgroup={device.netbios_workgroup}")
+        add("NetBIOS", ", ".join(bits) if bits else "replied, no names registered")
+    else:
+        add("NetBIOS", "no response", dim=True)
+
+    # Roku ECP — only attempted on devices that look like a Roku.
+    if device.roku_info:
+        n = len(device.roku_info)
+        add("Roku ECP", f"{n} {plural(n, 'field')}")
+    elif NetworkDiscovery._looks_like_roku(device):
+        add("Roku ECP", "queried, no info returned", dim=True)
+    else:
+        add("Roku ECP", "n/a", dim=True)
+
+    # Philips Hue /api/config — only attempted on devices that look like a Hue bridge.
+    if device.hue_info:
+        n = len(device.hue_info)
+        add("Hue config", f"{n} {plural(n, 'field')}")
+    elif NetworkDiscovery._looks_like_hue(device):
+        add("Hue config", "queried, no info returned", dim=True)
+    else:
+        add("Hue config", "n/a", dim=True)
+
+    # IPP Get-Printer-Attributes — only attempted on devices that look like a printer.
+    if device.ipp_attrs:
+        n = len(device.ipp_attrs)
+        add("IPP", f"{n} {plural(n, 'attribute')}")
+    elif NetworkDiscovery._looks_like_printer(device):
+        add("IPP", "queried, no attributes returned", dim=True)
+    else:
+        add("IPP", "n/a", dim=True)
+
+    # HTTP banners — TCP probe of a fixed port list on every device. The
+    # http_probe_results dict records every attempt's outcome, even failures.
+    if device.http_probe_results:
+        ok_ports = sorted(p for p, s in device.http_probe_results.items() if s == "ok")
+        n_total = len(device.http_probe_results)
+        n_ok = len(ok_ports)
+        if n_ok:
+            add("HTTP banners",
+                f"{n_ok}/{n_total} responded ({', '.join(str(p) for p in ok_ports)})")
+        else:
+            # Break down the failure modes so it's clear *why* nothing came back.
+            counts: dict[str, int] = {}
+            for s in device.http_probe_results.values():
+                counts[s] = counts.get(s, 0) + 1
+            parts = [f"{counts[k]} {k}" for k in ("closed", "timeout", "non-http") if counts.get(k)]
+            add("HTTP banners", f"0/{n_total} responded ({', '.join(parts)})", dim=True)
+    else:
+        add("HTTP banners", "not attempted", dim=True)
+
+    return lines
+
+
+def _help_lines() -> list[str]:
+    """Technical blurb shown by the '?' overlay on the device list."""
+    return [
+        "lan-scan — find local devices with mDNS, SSDP, and WS-Discovery",
+        "",
+        "Runs discovery protocols against the local subnet, then enriches",
+        "each discovered host with follow-up probes. Each UDP multicast",
+        "socket joins its group (IP_ADD_MEMBERSHIP) and bounded-waits for",
+        "replies. Multicast on Wi-Fi is lossy, so each query is sent",
+        "twice with a 0.3 s gap.",
+        "",
+        "── Discovery ──────────────────────────────────────────────",
+        "",
+        "mDNS / Bonjour / zeroconf            UDP 224.0.0.251 : 5353",
+        "  Sends a `_services._dns-sd._udp.local` meta-query (asks every",
+        "  responder to list all its advertised service types), plus a",
+        "  seed list of common types: _airplay._tcp, _raop._tcp (AirPlay",
+        "  audio), _hap._tcp / _homekit._tcp (HomeKit), _googlecast._tcp,",
+        "  _spotify-connect._tcp, _printer._tcp, _ipp._tcp, _smb._tcp,",
+        "  _afpovertcp._tcp, _ssh._tcp, _sftp-ssh._tcp, _device-info._tcp,",
+        "  _sonos._tcp, _soco._tcp, _http._tcp, _https._tcp. Any service",
+        "  type the meta-query surfaces that wasn't pre-listed gets a",
+        "  follow-up PTR query during the second half of the scan window.",
+        "  Used by Apple devices, Chromecast, HomeKit accessories, AirPrint",
+        "  printers, most network speakers, and anything implementing",
+        "  zeroconf.",
+        "",
+        "SSDP / UPnP discovery                UDP 239.255.255.250 : 1900",
+        "  Sends `M-SEARCH * HTTP/1.1` (HTTP-over-UDP) with two STs:",
+        "  `ssdp:all` and `upnp:rootdevice` (some devices only answer the",
+        "  narrower one). Replies carry a LOCATION header pointing at an",
+        "  XML device description, which is HTTP-fetched in the enrichment",
+        "  phase and rendered as a device/service tree in the detail popup.",
+        "  SSDP itself is just the discovery leg of UPnP. Used by routers",
+        "  / IGDs, Sonos, Roku, smart TVs, NAS boxes, media servers, and",
+        "  most \"DLNA\" gear.",
+        "",
+        "WS-Discovery                         UDP 239.255.255.250 : 3702",
+        "  Sends a SOAP-over-UDP <Probe> envelope. ProbeMatch responses",
+        "  carry qualified Types (e.g. tds:Device) and XAddrs (HTTP",
+        "  endpoint URLs for follow-up SOAP metadata queries — ONVIF",
+        "  GetDeviceInformation, etc.). Used by Windows Function Discovery,",
+        "  ONVIF IP cameras, and most networked printers/scanners.",
+        "",
+        "ARP sweep                            link-layer, local subnet",
+        "  Runs `sudo nmap -sn -PR <subnet>` to send an ARP request to",
+        "  every host on the local subnet and capture who replies.",
+        "  Catches the large class of devices that ignore all multicast",
+        "  (cheap IoT gadgets, smart plugs, doorbells) which sit silently",
+        "  on the LAN until something polls them. Requires nmap and sudo",
+        "  authorization; run `lan-scan --setup-sudoers` for passwordless",
+        "  setup. Without nmap and sudo authorization, lan-scan will skip",
+        "  the ARP sweep.",
+        "",
+        "── Enrichment (per discovered host) ───────────────────────",
+        "",
+        "UPnP device description    HTTP GET on each SSDP LOCATION URL",
+        "  Parses <friendlyName>, <manufacturer>, <modelName>, <UDN>, and",
+        "  the nested <deviceList> / <serviceList> tree. Rendered as the",
+        "  hierarchical view in the device-details popup.",
+        "",
+        "NetBIOS NBSTAT name query  UDP 137",
+        "  Returns the host's NetBIOS name list and workgroup/domain.",
+        "",
+        "HTTP banner grabs          TCP 80, 8080, 8008, 631, 443, 8443",
+        "  Connects, sends GET /, extracts the Server: header and HTML",
+        "  <title>.",
+        "",
+        "IPP Get-Printer-Attributes                            TCP 631",
+        "  On hosts that look like printers, asks for make and model,",
+        "  admin info/location, and live state. (Model is often the only",
+        "  identity source for printers that are silent on mDNS.)",
+        "",
+        "Reverse DNS",
+        "  Asks the configured resolver for a PTR record on each host's",
+        "  IP. Useful when DHCP hands out a local DNS server for devices",
+        "  to coordinate names.",
+        "",
+        "Vendor-specific pokes      (Roku, Hue, ...)",
+        "  Triggered on hosts that look like a known vendor's gear (mDNS",
+        "  service type, OUI, or SSDP model string). Roku ECP: GET",
+        "  /query/device-info on TCP 8060 for friendly name / model /",
+        "  serial. Hue: GET /api/config on TCP 80 for bridge metadata",
+        "  (model, firmware, API version, bridge ID, MAC).",
+        "",
+        "── Display ────────────────────────────────────────────────",
+        "",
+        "Devices new since the last saved run are highlighted in green;",
+        "devices missing since the last run are listed dimmed at the",
+        "bottom.",
+        "",
+        "── Keys (this view) ───────────────────────────────────────",
+        "",
+        "  ↑ ↓ / j k     navigate device list",
+        "  PgUp / PgDn   scroll text",
+        "  ENTER         open/close details",
+        "  ?             show this help",
+        "  q / ESC       back/quit",
+    ]
+
+
+class CursesUI:
+    def __init__(self, discovery: NetworkDiscovery, review_timestamp: Optional[str] = None):
+        self.discovery = discovery
+        self.devices: list[Device] = []
+        self.selected = 0
+        self.scroll_offset = 0
+        self.detail_scroll = 0
+        self.showing_detail = False
+        self.showing_help = False
+        self.help_scroll = 0
+        # When set, skip live discovery and just browse pre-loaded devices.
+        self.review_timestamp = review_timestamp
+        # Set when a live scan finishes; feeds the status bar's "at <time>".
+        self.scan_timestamp: Optional[str] = None
+
+    def run(self, stdscr):
+        curses.set_escdelay(50)  # Default 1000ms feels laggy; 50ms is snappy.
+        curses.curs_set(0)  # Hide cursor
+        curses.use_default_colors()
+
+        # Initialize color pairs
+        curses.init_pair(1, curses.COLOR_BLACK, curses.COLOR_WHITE)  # Selected
+        curses.init_pair(2, curses.COLOR_CYAN, -1)  # Header / separators
+        curses.init_pair(3, curses.COLOR_YELLOW, -1)  # Accent
+        curses.init_pair(4, curses.COLOR_GREEN, -1)  # New device (since last run)
+        curses.init_pair(5, curses.COLOR_BLACK, curses.COLOR_GREEN)  # Selected + new
+
+        stdscr.clear()
+        stdscr.attron(curses.color_pair(2) | curses.A_BOLD)
+        if self.review_timestamp:
+            header = f"Reviewing previous scan from {self.review_timestamp}"
+        else:
+            header = "Scanning..."
+        stdscr.addstr(0, 0, header)
+        stdscr.attroff(curses.color_pair(2) | curses.A_BOLD)
+        stdscr.refresh()
+
+        line = [2]  # mutable so the closure can advance it
+        rows: dict[str, int] = {}  # progress key -> screen row, for in-place updates
+
+        def progress(msg: str, key=None, final=False):
+            # A keyed message rewrites its previous row in place (live per-stage
+            # counters); an unkeyed one appends a new line. `final` is only
+            # meaningful to plain-stdout consumers, so it's ignored here.
+            if key is not None and key in rows:
+                row = rows[key]
+            else:
+                row = line[0]
+                line[0] += 1
+                if key is not None:
+                    rows[key] = row
+            try:
+                stdscr.move(row, 0)
+                stdscr.clrtoeol()  # clear stale text when the new line is shorter
+                stdscr.addstr(row, 0, msg)
+            except curses.error:
+                pass
+            stdscr.refresh()
+
+        if self.review_timestamp:
+            # Skip the live scan; self.discovery is already populated.
+            n = len(self.discovery.devices)
+            progress(f"Loaded {n} {plural(n, 'device')} from cache.")
+        else:
+            asyncio.run(self.discovery.discover(timeout=3.0, on_progress=progress))
+            self.scan_timestamp = datetime.now().isoformat(timespec="seconds")
+
+        # Diff against previous run, if available (skipped in review mode —
+        # there's no "previous" relative to a static cached snapshot).
+        if not self.review_timestamp:
+            previous = getattr(self.discovery, "_pending_diff", None)
+            if previous is not None:
+                self.discovery.apply_diff(previous)
+
+        # Sort devices by IP
+        self.devices = sorted(
+            self.discovery.devices.values(),
+            key=lambda d: tuple(map(int, d.address.split(".")))
+        )
+
+        line[0] += 1
+        if not self.devices:
+            stdscr.addstr(line[0], 0, "No devices found. Press any key to exit.")
+            stdscr.refresh()
+            stdscr.getch()
+            return
+
+        # Quick confirmation gate before opening the device list, so scan
+        # results stay visible long enough for the user to glance at the
+        # per-stage counts. Skipped in review mode (no scan was just shown).
+        if not self.review_timestamp:
+            stdscr.attron(curses.color_pair(3) | curses.A_BOLD)
+            stdscr.addstr(
+                line[0], 0,
+                f"Found {len(self.devices)} {plural(len(self.devices), 'device')}. "
+                "Press ENTER to view, q to quit.",
+            )
+            stdscr.attroff(curses.color_pair(3) | curses.A_BOLD)
+            stdscr.refresh()
+
+            while True:
+                k = stdscr.getch()
+                if k in (10, 13, curses.KEY_ENTER):
+                    break
+                if k in (ord('q'), 27):
+                    return
+
+        # Main loop
+        while True:
+            # The list is drawn every iteration so the popups overlay it.
+            self._draw_list(stdscr)
+            if self.showing_detail:
+                self._draw_detail(stdscr)
+            if self.showing_help:
+                self._draw_help(stdscr)
+
+            key = stdscr.getch()
+
+            # Help is modal — handle its keys exclusively while open.
+            if self.showing_help:
+                if key in (ord('q'), 27, ord('?'), ord('\n'), curses.KEY_ENTER):
+                    self.showing_help = False
+                    self.help_scroll = 0
+                elif key in (curses.KEY_UP, ord('k')):
+                    self.help_scroll = max(0, self.help_scroll - 1)
+                elif key in (curses.KEY_DOWN, ord('j')):
+                    self.help_scroll += 1  # clamped in _draw_help
+                elif key == curses.KEY_PPAGE:
+                    page = max(1, stdscr.getmaxyx()[0] - 3)
+                    self.help_scroll = max(0, self.help_scroll - page)
+                elif key == curses.KEY_NPAGE:
+                    page = max(1, stdscr.getmaxyx()[0] - 3)
+                    self.help_scroll += page  # clamped in _draw_help
+                elif key == curses.KEY_RESIZE:
+                    stdscr.clear()
+                continue
+
+            if key == ord('q') or key == 27:  # q or ESC
+                if self.showing_detail:
+                    self.showing_detail = False
+                    self.detail_scroll = 0
+                else:
+                    break
+            elif key == ord('?'):
+                # '?' opens help from the list view. Ignored while a device
+                # detail popup is already up — keep one modal layer at a time.
+                if not self.showing_detail:
+                    self.showing_help = True
+                    self.help_scroll = 0
+            elif key == curses.KEY_UP:
+                if self.showing_detail:
+                    self.detail_scroll = max(0, self.detail_scroll - 1)
+                else:
+                    self.selected = max(0, self.selected - 1)
+                    self._adjust_scroll(stdscr)
+            elif key == curses.KEY_DOWN:
+                if self.showing_detail:
+                    self.detail_scroll += 1
+                else:
+                    self.selected = min(len(self.devices) - 1, self.selected + 1)
+                    self._adjust_scroll(stdscr)
+            elif key == ord('k'):
+                self.selected = max(0, self.selected - 1)
+                self.detail_scroll = 0
+                self._adjust_scroll(stdscr)
+            elif key == ord('j'):
+                self.selected = min(len(self.devices) - 1, self.selected + 1)
+                self.detail_scroll = 0
+                self._adjust_scroll(stdscr)
+            elif key == curses.KEY_PPAGE:
+                if self.showing_detail:
+                    page = max(1, stdscr.getmaxyx()[0] - 3)
+                    self.detail_scroll = max(0, self.detail_scroll - page)
+            elif key == curses.KEY_NPAGE:
+                if self.showing_detail:
+                    page = max(1, stdscr.getmaxyx()[0] - 3)
+                    self.detail_scroll += page  # clamped to max_scroll in _draw_detail
+            elif key == ord('\n') or key == curses.KEY_ENTER:
+                if self.showing_detail:
+                    self.showing_detail = False
+                    self.detail_scroll = 0
+                else:
+                    self.showing_detail = True
+                    self.detail_scroll = 0
+            elif key == curses.KEY_RESIZE:
+                stdscr.clear()
+
+    def _adjust_scroll(self, stdscr):
+        height, _ = stdscr.getmaxyx()
+        # Rows 0–1 are the header + rule; the bottom two rows are footers (scan
+        # summary + hotkeys).
+        list_height = height - 4
+
+        if self.selected < self.scroll_offset:
+            self.scroll_offset = self.selected
+        elif self.selected >= self.scroll_offset + list_height:
+            self.scroll_offset = self.selected - list_height + 1
+
+    def _draw_list(self, stdscr):
+        stdscr.clear()
+        height, width = stdscr.getmaxyx()
+
+        missing = self.discovery.missing_devices
+
+        # Rows 0–1 — column header + rule; separators at byte positions 16 and 49.
+        header = f"{'ADDRESS':<15} │ {'DEVICE':<30} │ NAME"
+        rule_chars = ["─"] * (width - 1)
+        for col in (16, 49):
+            if col < len(rule_chars):
+                rule_chars[col] = "┼"
+        stdscr.attron(curses.color_pair(2) | curses.A_BOLD)
+        stdscr.addnstr(0, 0, header, width - 1)
+        stdscr.addnstr(1, 0, "".join(rule_chars), width - 1)
+        stdscr.attroff(curses.color_pair(2) | curses.A_BOLD)
+
+        # Build the combined row list: current devices + (optional) missing section
+        rows: list[tuple] = [("device", d, i) for i, d in enumerate(self.devices)]
+        if missing:
+            rows.append(("section", "Missing since last run"))
+            for m in missing:
+                rows.append(("missing", m))
+
+        # Bottom two rows are footers (scan summary + hotkeys), plus header + rule on top.
+        list_height = height - 4
+        for i, row_data in enumerate(rows[self.scroll_offset:self.scroll_offset + list_height]):
+            screen_row = i + 2
+            kind = row_data[0]
+
+            if kind == "section":
+                title = row_data[1]
+                section_line = f"── {title} " + "─" * max(0, width - 5 - len(title))
+                stdscr.attron(curses.color_pair(2))
+                stdscr.addnstr(screen_row, 0, section_line, width - 1)
+                stdscr.attroff(curses.color_pair(2))
+            elif kind == "device":
+                self._draw_device_row(stdscr, screen_row, width, row_data[1], row_data[2] == self.selected)
+            elif kind == "missing":
+                self._draw_missing_row(stdscr, screen_row, width, row_data[1])
+
+        # Footer — suppressed while a popup is open, since the popup has its
+        # own footer and the list's "ENTER: details" hint would be misleading
+        # in that mode.
+        if not self.showing_detail and not self.showing_help:
+            # First footer row: what was scanned, the new/missing diff, and when.
+            new_count = sum(1 for d in self.devices if d.is_new)
+            summary = _run_summary(
+                len(self.devices), self.discovery.subnet,
+                self.review_timestamp or self.scan_timestamp,
+                new=new_count, missing=len(missing),
+            )
+            stdscr.attron(curses.color_pair(2))
+            stdscr.addnstr(height - 2, 0, summary.center(width - 1), width - 1)
+            stdscr.attroff(curses.color_pair(2))
+
+            # Second footer row: the hotkeys.
+            parts = ["UP/DOWN: navigate", "ENTER: details", "?: help", "q: quit"]
+            footer = " " + " │ ".join(parts) + " "
+            stdscr.attron(curses.color_pair(2))
+            stdscr.addnstr(height - 1, 0, footer.center(width - 1), width - 1)
+            stdscr.attroff(curses.color_pair(2))
+
+        stdscr.refresh()
+
+    def _draw_device_row(self, stdscr, row, width, device, is_selected):
+        device_kind = resolve_device_kind(device)[:30]
+        name = (resolve_name(device) or "")
+        max_name_len = width - 50
+        if len(name) > max_name_len:
+            name = name[:max_name_len - 3] + "..."
+
+        line = f"{device.address:<15} │ {device_kind:<30} │ {name}"
+
+        if is_selected:
+            pair = curses.color_pair(5) if device.is_new else curses.color_pair(1)
+            stdscr.attron(pair)
+            stdscr.addnstr(row, 0, line.ljust(width - 1), width - 1)
+            stdscr.attroff(pair)
+        else:
+            row_attr = curses.color_pair(4) if device.is_new else 0
+            segments = [
+                (f"{device.address:<15} ", row_attr),
+                ("│", curses.color_pair(2)),
+                (f" {device_kind:<30} ", row_attr),
+                ("│", curses.color_pair(2)),
+                (f" {name}", row_attr),
+            ]
+            col = 0
+            for text, attr in segments:
+                if col >= width - 1:
+                    break
+                if attr:
+                    stdscr.attron(attr)
+                stdscr.addnstr(row, col, text, width - 1 - col)
+                if attr:
+                    stdscr.attroff(attr)
+                col += len(text)
+
+    def _draw_missing_row(self, stdscr, row, width, m: dict):
+        # m is a raw saved device dict from the previous run. Rehydrate so the
+        # same resolvers feed both current and missing rows.
+        ghost = _device_from_dict(m)
+        device_kind = resolve_device_kind(ghost)[:30]
+        name = (resolve_name(ghost) or "")
+        max_name_len = width - 50
+        if len(name) > max_name_len:
+            name = name[:max_name_len - 3] + "..."
+        line = f"{m['address']:<15} │ {device_kind:<30} │ {name}"
+        stdscr.attron(curses.A_DIM)
+        stdscr.addnstr(row, 0, line, width - 1)
+        stdscr.attroff(curses.A_DIM)
+
+    def _draw_detail(self, stdscr):
+        # Drawn as a centered popup on top of the existing list — no clear().
+        screen_h, screen_w = stdscr.getmaxyx()
+
+        # Popup geometry: leaves a margin so the underlying list peeks around it.
+        margin_x = max(2, screen_w // 12)
+        margin_y = max(1, screen_h // 10)
+        top = margin_y
+        left = margin_x
+        bottom = screen_h - 1 - margin_y
+        right = screen_w - 1 - margin_x
+        if bottom - top < 4 or right - left < 20:
+            # Terminal too small for a popup — fall back to fullscreen overlay.
+            top, left, bottom, right = 0, 0, screen_h - 1, screen_w - 1
+
+        box_w = right - left + 1
+        # Content area sits inside the box, leaving 1-row border top/bottom
+        # and 1-col padding left/right.
+        content_left = left + 2
+        content_right = right - 2
+        content_w = content_right - content_left + 1
+        content_top = top + 1
+        content_bottom = bottom - 1
+        content_height = content_bottom - content_top + 1
+
+        device = self.devices[self.selected]
+
+        # Draw the popup frame
+        try:
+            stdscr.attron(curses.color_pair(2))
+            stdscr.addstr(top, left, "┌" + "─" * (box_w - 2) + "┐")
+            for r in range(top + 1, bottom):
+                stdscr.addstr(r, left, "│")
+                stdscr.addstr(r, right, "│")
+                # Blank the popup interior so list rows behind don't show through.
+                stdscr.addstr(r, left + 1, " " * (box_w - 2))
+            stdscr.addstr(bottom, left, "└" + "─" * (box_w - 2) + "┘")
+            stdscr.attroff(curses.color_pair(2))
+        except curses.error:
+            pass
+
+        # Title centered on top border
+        title = f" Device Details: {device.address} "
+        title_col = left + max(1, (box_w - len(title)) // 2)
+        try:
+            stdscr.attron(curses.color_pair(2) | curses.A_BOLD)
+            stdscr.addnstr(top, title_col, title, box_w - 2)
+            stdscr.attroff(curses.color_pair(2) | curses.A_BOLD)
+        except curses.error:
+            pass
+
+        # Build detail lines
+        lines = []
+        lines.append(f"IP Address: {device.address}")
+        if device.mac_address:
+            mac_line = f"MAC Address: {device.mac_address}"
+            if device.oui_registrant:
+                mac_line += f" ({device.oui_registrant})"
+            elif _is_locally_administered_mac(device.mac_address):
+                # OUI lookup is useless for locally-administered MACs; on a home
+                # LAN these are almost always per-SSID privacy randomization
+                # (iOS/Android/Windows), with VM/container bridges a distant 2nd.
+                mac_line += " (likely randomized)"
+            lines.append(mac_line)
+        # Per-probe status block — fixed length, so it sits up front as a
+        # header. Device kind and Name are downstream of these results, so
+        # they appear after.
+        lines.append("Probes:")
+        lines.extend(_format_probe_status(device))
+
+        lines.append(f"Device: {resolve_device_kind(device)}")
+        resolved_name = resolve_name(device)
+        if resolved_name:
+            lines.append(f"Name: {resolved_name}")
+
+        # Surface every name-like signal we have, in resolve_name's priority
+        # order. This makes it obvious which source the resolver picked and
+        # what fallback signals exist behind it.
+        name_sources: list[tuple[str, Optional[str]]] = [
+            ("Roku friendly name",   device.roku_friendly_name),
+            ("Sonos room name",      device.upnp_room_name),
+            ("UPnP friendly name",   device.upnp_friendly_name),
+            ("WSD friendly name",    device.wsd_friendly_name),
+            ("IPP printer-info",     device.ipp_info),
+            ("mDNS TXT 'fn'",        device.txt_records.get("fn")),
+            ("mDNS A record",        device.mdns_a_name),
+            ("mDNS instance name",   device.mdns_instance_name),
+            ("NetBIOS name",         device.netbios_name),
+            ("mDNS SRV target",     device.mdns_srv_name),
+            ("Reverse DNS",          device.rdns_name),
+        ]
+        shown_sources = [(label, val) for label, val in name_sources if val]
+        if shown_sources:
+            label_w = max(len(label) for label, _ in shown_sources)
+            for label, val in shown_sources:
+                lines.append(f"  {label:<{label_w}} : {val}")
+
+        if device.netbios_workgroup:
+            lines.append(f"NetBIOS Workgroup: {device.netbios_workgroup}")
+        # Reply-but-no-names case (e.g. macOS smbd): provenance flags that we
+        # got a NetBIOS reply, but the device returned an empty name list.
+        if "netbios" in device.provenance and not (device.netbios_name or device.netbios_workgroup):
+            lines.append("NetBIOS: replied, no names registered")
+        def append_wrapped(prefix: str, items: list[str]):
+            """Append `prefix` + comma-separated items, wrapped to fit the
+            popup width with continuation lines indented to match the prefix."""
+            indent = " " * len(prefix)
+            max_line_len = content_w - 2
+            current_line = prefix
+            first = True
+            for item in items:
+                addition = item if first else f", {item}"
+                if len(current_line) + len(addition) > max_line_len:
+                    lines.append(current_line)
+                    current_line = indent + item
+                else:
+                    current_line += addition
+                first = False
+            if current_line.strip():
+                lines.append(current_line)
+
+        def append_txt_record(key: str, value: str):
+            """Append a dimmed 'key: value' TXT line, wrapping the value across
+            continuation lines so nothing is clipped at the popup edge. Breaks
+            after a comma or at a space when possible (TXT values like `pdl` are
+            comma-separated lists), and hard-splits any run with no such break.
+            Continuation lines keep the dim marker and hang-indent under the key."""
+            if not value:
+                lines.append(DIM_LINE_MARKER + f"  {key}")
+                return
+            head = f"  {key}: "
+            # Continuation lines hang-indent to align directly under the value, so
+            # wrapped text reads as part of the record rather than a new key. Fall
+            # back to a small fixed indent if the key is long enough to crowd it.
+            cont = " " * len(head) if len(head) <= content_w - 8 else "      "
+            avail = max(8, content_w - len(head))
+            rest = value
+            first = True
+            while rest:
+                width = avail if first else max(8, content_w - len(cont))
+                if len(rest) <= width:
+                    chunk, rest = rest, ""
+                else:
+                    window = rest[:width]
+                    comma = window.rfind(",")
+                    if comma >= width // 2:      # break just after a comma
+                        cut = comma + 1
+                    else:
+                        # else the rightmost space or '/' (keeps URLs readable);
+                        # failing that, a hard split so nothing is dropped.
+                        brk = max(window.rfind(" "), window.rfind("/"))
+                        cut = brk + 1 if brk >= width // 2 else width
+                    chunk, rest = rest[:cut].rstrip(), rest[cut:].lstrip()
+                prefix = head if first else cont
+                lines.append(DIM_LINE_MARKER + prefix + chunk)
+                first = False
+
+        # WS-Discovery services live here as a compact line; mDNS services
+        # have moved into the dedicated `── mDNS ──` section below alongside
+        # their TXT records. SSDP services are omitted here entirely — when
+        # present, they're shown as a hierarchical device/service tree in
+        # the UPnP Device Description section below.
+        if device.wsd_services:
+            append_wrapped("WS-D types:    ", sorted(device.wsd_services))
+        # DPWS metadata resolved by the WS-Transfer Get enrichment step.
+        wsd_meta = " ".join(
+            p for p in (device.wsd_manufacturer, device.wsd_model) if p
+        )
+        if wsd_meta:
+            lines.append(f"WSD model:     {wsd_meta}")
+        # IPP Get-Printer-Attributes results (model, admin description/location,
+        # live state and any state reasons) — fields with no mDNS equivalent,
+        # shown in source order. Keys mirror the snapshot built in enrich_ipp.
+        for ipp_label, ipp_key in (("IPP model:     ", "printer-make-and-model"),
+                                   ("IPP info:      ", "printer-info"),
+                                   ("IPP location:  ", "printer-location"),
+                                   ("IPP state:     ", "printer-state"),
+                                   ("IPP reasons:   ", "printer-state-reasons")):
+            ipp_val = device.ipp_attrs.get(ipp_key)
+            if ipp_val:
+                lines.append(f"{ipp_label}{ipp_val}")
+
+        # Leaked MACs — hardware MACs the device disclosed via mDNS instance
+        # names even when using a randomized MAC on the wire. Show the OUI
+        # registrant when we can resolve it.
+        for mac, registrant in sorted(device.leaked_macs.items()):
+            label = f"Leaked MAC: {mac}"
+            if registrant:
+                label += f" ({registrant})"
+            lines.append(label)
+
+        def section(title: str) -> str:
+            # Trailing dashes get truncated to the popup width when drawn
+            return f"── {title} " + "─" * max(0, content_w - 4 - len(title))
+
+        # Section order: standard protocols first (UPnP, mDNS, WS-Discovery,
+        # HTTP banners), then vendor-specific enrichment probes (Roku ECP,
+        # Hue /api/config, plus any future vendor-specific follow-ups).
+
+        # One section per fetched LOCATION URL. A single device often advertises
+        # several (rootdevice, MediaServer, MediaRenderer, etc.) and their
+        # descriptions can differ — render each rather than collapsing them.
+        for url in sorted(device.xml_data):
+            lines.append("")
+            lines.append(section("UPnP Device Description"))
+            lines.append(f" {url}")
+            lines.extend(format_xml(device.xml_data[url]))
+
+        # Combined mDNS section: services prominent (normal weight); TXT
+        # records dimmed since most keys are device-internal noise
+        # (deviceid, public keys, status flags) and the genuinely useful
+        # ones (fn, md, model) already feed into the Name resolver above.
+        if device.mdns_services or device.txt_records:
+            lines.append("")
+            lines.append(section("mDNS"))
+            if device.mdns_services:
+                append_wrapped("Services: ", sorted(device.mdns_services))
+            if device.txt_records:
+                lines.append(DIM_LINE_MARKER + "TXT records:")
+                for key, value in sorted(device.txt_records.items()):
+                    append_txt_record(key, value)
+
+        # WS-Discovery endpoint URLs (XAddrs) — the SOAP endpoints the device
+        # exposes for follow-up metadata queries (ONVIF GetDeviceInformation, etc).
+        if device.wsd_xaddrs:
+            lines.append("")
+            lines.append(section("WS-Discovery endpoints"))
+            for url in sorted(device.wsd_xaddrs):
+                lines.append(f"  {url}")
+
+        if device.http_banners:
+            lines.append("")
+            lines.append(section("HTTP banners"))
+            for port in sorted(device.http_banners.keys()):
+                banner = device.http_banners[port]
+                scheme = "https" if port in (443, 8443) else "http"
+                header = f"{scheme}://{device.address}:{port}"
+                status = banner.get("status")
+                if status:
+                    header += f"  [{status}]"
+                lines.append(header)
+                if banner.get("server"):
+                    lines.append(f"  Server: {banner['server']}")
+                if banner.get("title"):
+                    lines.append(f"  Title:  {banner['title']}")
+
+        if device.roku_info:
+            lines.append("")
+            lines.append(section("Roku ECP device-info"))
+            for key, value in sorted(device.roku_info.items()):
+                lines.append(f"{key}: {value}")
+
+        if device.hue_info:
+            lines.append("")
+            lines.append(section("Hue /api/config"))
+            for key, value in sorted(device.hue_info.items()):
+                lines.append(f"{key}: {value}")
+
+        # Display with scrolling — clamp scroll and render into the popup body.
+        max_scroll = max(0, len(lines) - content_height)
+        self.detail_scroll = min(self.detail_scroll, max_scroll)
+
+        for i, line in enumerate(lines[self.detail_scroll:self.detail_scroll + content_height]):
+            row = content_top + i
+            try:
+                is_dim = line.startswith(DIM_LINE_MARKER)
+                if is_dim:
+                    line = line[len(DIM_LINE_MARKER):]
+                is_section = line.startswith("── ")
+                # UPnP device-tree nodes (rendered by format_xml) carry the folder
+                # icon — render them bold to distinguish containers from services.
+                is_device_node = UPNP_DEVICE_ICON in line
+                attr = 0
+                if is_section:
+                    attr = curses.color_pair(2)
+                elif is_device_node:
+                    attr = curses.A_BOLD
+                elif is_dim:
+                    attr = curses.A_DIM
+                if attr:
+                    stdscr.attron(attr)
+                stdscr.addnstr(row, content_left, line[:content_w], content_w)
+                if attr:
+                    stdscr.attroff(attr)
+            except curses.error:
+                pass
+
+        # Footer drawn on the bottom border of the popup
+        if len(lines) <= content_height:
+            footer = " j/k: next/prev device | ENTER: close "
+        else:
+            scroll_info = f"{self.detail_scroll + 1}-{min(self.detail_scroll + content_height, len(lines))}/{len(lines)}"
+            footer = f" Line {scroll_info} | j/k: next/prev device | ENTER: close "
+        footer_col = left + max(1, (box_w - len(footer)) // 2)
+        try:
+            stdscr.attron(curses.color_pair(2) | curses.A_BOLD)
+            stdscr.addnstr(bottom, footer_col, footer, box_w - 2)
+            stdscr.attroff(curses.color_pair(2) | curses.A_BOLD)
+        except curses.error:
+            pass
+
+        stdscr.refresh()
+
+    def _draw_help(self, stdscr):
+        """Modal help overlay — same popup geometry as _draw_detail."""
+        screen_h, screen_w = stdscr.getmaxyx()
+
+        margin_x = max(2, screen_w // 12)
+        margin_y = max(1, screen_h // 10)
+        top = margin_y
+        left = margin_x
+        bottom = screen_h - 1 - margin_y
+        right = screen_w - 1 - margin_x
+        if bottom - top < 4 or right - left < 20:
+            # Terminal too small for a popup — fall back to fullscreen overlay.
+            top, left, bottom, right = 0, 0, screen_h - 1, screen_w - 1
+
+        box_w = right - left + 1
+        content_left = left + 2
+        content_right = right - 2
+        content_w = content_right - content_left + 1
+        content_top = top + 1
+        content_bottom = bottom - 1
+        content_height = content_bottom - content_top + 1
+
+        # Draw popup frame
+        try:
+            stdscr.attron(curses.color_pair(2))
+            stdscr.addstr(top, left, "┌" + "─" * (box_w - 2) + "┐")
+            for r in range(top + 1, bottom):
+                stdscr.addstr(r, left, "│")
+                stdscr.addstr(r, right, "│")
+                stdscr.addstr(r, left + 1, " " * (box_w - 2))
+            stdscr.addstr(bottom, left, "└" + "─" * (box_w - 2) + "┘")
+            stdscr.attroff(curses.color_pair(2))
+        except curses.error:
+            pass
+
+        # Title centered on top border
+        title = " Help "
+        title_col = left + max(1, (box_w - len(title)) // 2)
+        try:
+            stdscr.attron(curses.color_pair(2) | curses.A_BOLD)
+            stdscr.addnstr(top, title_col, title, box_w - 2)
+            stdscr.attroff(curses.color_pair(2) | curses.A_BOLD)
+        except curses.error:
+            pass
+
+        lines = _help_lines()
+        max_scroll = max(0, len(lines) - content_height)
+        self.help_scroll = min(self.help_scroll, max_scroll)
+
+        for i, line in enumerate(lines[self.help_scroll:self.help_scroll + content_height]):
+            row = content_top + i
+            try:
+                is_section = line.startswith("── ")
+                if is_section:
+                    stdscr.attron(curses.color_pair(2))
+                stdscr.addnstr(row, content_left, line[:content_w], content_w)
+                if is_section:
+                    stdscr.attroff(curses.color_pair(2))
+            except curses.error:
+                pass
+
+        # Footer drawn on the bottom border of the popup
+        if len(lines) <= content_height:
+            footer = " ? / ENTER / q / ESC: back "
+        else:
+            scroll_info = f"{self.help_scroll + 1}-{min(self.help_scroll + content_height, len(lines))}/{len(lines)}"
+            footer = f" Line {scroll_info} | PgUp/PgDn: scroll | ? / ENTER / q / ESC: back "
+        footer_col = left + max(1, (box_w - len(footer)) // 2)
+        try:
+            stdscr.attron(curses.color_pair(2) | curses.A_BOLD)
+            stdscr.addnstr(bottom, footer_col, footer, box_w - 2)
+            stdscr.attroff(curses.color_pair(2) | curses.A_BOLD)
+        except curses.error:
+            pass
+
+        stdscr.refresh()
+
+
+def setup_sudoers() -> int:
+    """Print the sudoers entry needed for passwordless nmap ARP scanning."""
+    import getpass
+
+    nmap_path = shutil.which("nmap")
+    if not nmap_path:
+        print("nmap not found in PATH. Install it first:")
+        print("    brew install nmap")
+        return 1
+
+    subnet = NetworkDiscovery()._arp_sweep_subnet()
+    if not subnet:
+        print("Could not determine local subnet (no network connection?).")
+        return 1
+
+    user = getpass.getuser()
+    entry = f"{user} ALL=(root) NOPASSWD: {nmap_path} -sn -PR -oG - {subnet}"
+    sudoers_file = "/etc/sudoers.d/lan-scan"
+
+    print("To enable active ARP discovery without password prompts, add this sudoers entry:")
+    print()
+    print(f"  {entry}")
+    print()
+    print(f"This can be placed in, e.g.: {sudoers_file}")
+    print()
+    print(f"Note: {subnet} is hardcoded into this authorization, so other subnets")
+    print("will still require manual authorization (or re-run --setup-sudoers).")
+    return 0
+
+
+def _arp_sudo_status(discovery: "NetworkDiscovery") -> str:
+    """Silent check of whether the ARP-scan sudo invocation is already authorized.
+
+    Returns:
+      'ok'     — cached creds or NOPASSWD entry; sudo will not prompt.
+      'prompt' — sudo would prompt for a password; caller may decide whether
+                 to interactively prompt now.
+      'skip'   — nothing to authorize (nmap not installed, or no local subnet).
+                 ARP scan will be skipped regardless.
+    """
+    nmap_path = shutil.which("nmap")
+    if not nmap_path:
+        return 'skip'
+    subnet = discovery._arp_sweep_subnet()
+    if not subnet:
+        return 'skip'
+    # Test the exact command we'll run, without prompting. Matches both
+    # NOPASSWD entries and valid cached creds.
+    cmd = [nmap_path, "-sn", "-PR", "-oG", "-", subnet]
+    result = subprocess.run(
+        ["sudo", "-n", "-l"] + cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=5,
+    )
+    return 'ok' if result.returncode == 0 else 'prompt'
+
+
+def check_and_authorize_sudo(discovery: "NetworkDiscovery") -> None:
+    """If sudo for the ARP scan isn't already authorized, prompt the user
+    interactively (in cooked terminal mode) to authorize it. No-op when
+    already authorized or when there's nothing to authorize."""
+    if _arp_sudo_status(discovery) != 'prompt':
+        return
+
+    nmap_path = shutil.which("nmap")
+    subnet = discovery._arp_sweep_subnet()
+
+    print()
+    print("Active ARP discovery (recommended) requires sudo to run the command:")
+    print(f"    sudo {nmap_path} -sn -PR -oG - {subnet}")
+    print()
+    print("For permanent passwordless setup, run:")
+    print(f"    python3 {sys.argv[0]} --setup-sudoers")
+    print()
+    try:
+        response = input("Authorize sudo now? [Y/n] (will prompt for password) ").strip().lower()
+    except EOFError:
+        response = ""
+    except KeyboardInterrupt:
+        print()
+        sys.exit(130)
+
+    if response == "n":
+        print("ARP scan will be skipped.")
+        print()
+        return
+
+    # Cache credentials interactively (no command runs, just updates sudo timestamp)
+    subprocess.run(["sudo", "-v"])
+    print()
+
+
+def _startup_menu(stdscr, history: list[dict]) -> Optional[tuple[str, Optional[dict]]]:
+    """Curses startup menu: 'New scan' followed by a list of historic scans.
+
+    Returns ('new', None), ('load', history_entry), or None to exit."""
+    curses.set_escdelay(50)
+    curses.curs_set(0)
+    curses.use_default_colors()
+    curses.init_pair(1, curses.COLOR_BLACK, curses.COLOR_WHITE)  # Selected
+    curses.init_pair(2, curses.COLOR_CYAN, -1)                   # Header / separator / footer
+
+    # items: (kind, label, payload) where kind ∈ {"new", "separator", "history"}
+    items: list[tuple[str, str, Optional[dict]]] = [("new", "New scan", None)]
+    if history:
+        items.append(("separator", "", None))
+        for entry in history:
+            label = _run_summary(entry["n_devices"], entry["subnet"], entry["timestamp"], align=True)
+            items.append(("history", label, entry))
+
+    selectable = [i for i, item in enumerate(items) if item[0] != "separator"]
+    cur = 0  # index into `selectable`
+
+    while True:
+        stdscr.clear()
+        height, width = stdscr.getmaxyx()
+
+        stdscr.attron(curses.color_pair(2) | curses.A_BOLD)
+        stdscr.addnstr(0, 0, "lan-scan", width - 1)
+        stdscr.attroff(curses.color_pair(2) | curses.A_BOLD)
+
+        for i, (kind, text, _) in enumerate(items):
+            row = i + 2
+            if row >= height - 1:
+                break
+            try:
+                if kind == "separator":
+                    stdscr.attron(curses.color_pair(2))
+                    stdscr.addnstr(row, 0, "─" * (width - 1), width - 1)
+                    stdscr.attroff(curses.color_pair(2))
+                elif selectable[cur] == i:
+                    stdscr.attron(curses.color_pair(1))
+                    stdscr.addnstr(row, 0, text.ljust(width - 1), width - 1)
+                    stdscr.attroff(curses.color_pair(1))
+                else:
+                    stdscr.addnstr(row, 0, text, width - 1)
+            except curses.error:
+                pass
+
+        footer = " UP/DOWN: navigate │ ENTER: select │ q/ESC: quit "
+        try:
+            stdscr.attron(curses.color_pair(2))
+            stdscr.addnstr(height - 1, 0, footer.center(width - 1), width - 1)
+            stdscr.attroff(curses.color_pair(2))
+        except curses.error:
+            pass
+
+        stdscr.refresh()
+
+        try:
+            key = stdscr.getch()
+        except KeyboardInterrupt:
+            return None
+
+        if key in (ord('q'), 27, 3):  # q, ESC, Ctrl-C (raw mode safety)
+            return None
+        elif key in (curses.KEY_UP, ord('k')):
+            cur = max(0, cur - 1)
+        elif key in (curses.KEY_DOWN, ord('j')):
+            cur = min(len(selectable) - 1, cur + 1)
+        elif key in (10, 13, curses.KEY_ENTER):
+            kind, _, payload = items[selectable[cur]]
+            if kind == "new":
+                return ("new", None)
+            if kind == "history":
+                return ("load", payload)
+        elif key == curses.KEY_RESIZE:
+            stdscr.clear()
+
+
+USAGE = """\
+Usage: lan-scan [OPTIONS]
+
+See what's on the local network. Discovery via ARP, mDNS,
+SSDP, and WS-Discovery; per-host enrichment via NetBIOS, UPnP, HTTP
+banner grabs, reverse DNS, and a few vendor-specific pokes.
+
+Options:
+  -h, --help          Show this help and exit.
+  --new-scan          Run a new scan in the TUI (skips the new/previous prompt).
+  --load-previous     Load the previously-saved scan in the TUI (skips the
+                      prompt). Exits 1 if there is no saved scan.
+  --print             Run a scan and print results to stdout (no TUI, no
+                      interactive prompt). Saves the run like the TUI does.
+  --print-previous    Print the previously-saved scan (no scan, no TUI, no
+                      save). Exits 1 if there is no saved scan.
+  --setup-sudoers     Print the sudoers entry needed for passwordless ARP
+                      discovery via nmap.
+
+Default (no options): interactive prompt for new scan vs. load previous, then
+the curses TUI.
+"""
+
+
+def _run_new_scan_tui(previous: Optional[dict]) -> None:
+    discovery = NetworkDiscovery()
+    current_subnet = discovery._get_local_subnet()
+    ensure_manuf()
+
+    # Diff against the previous run only if the subnet matches
+    if previous and previous.get("subnet") == current_subnet:
+        discovery._pending_diff = previous
+
+    check_and_authorize_sudo(discovery)
+
+    ui = CursesUI(discovery)
+    try:
+        curses.wrapper(ui.run)
+    except KeyboardInterrupt:
+        # Abort path: deliberately do NOT save. The previous run's JSON stays
+        # on disk so --load-previous still recalls the prior good snapshot.
+        sys.exit(130)
+    save_run(discovery.devices.values(), current_subnet, discovery.missing_devices)
+
+
+def _load_previous_tui(previous: Optional[dict]) -> None:
+    if not previous:
+        print("No previous scan on file.", file=sys.stderr)
+        sys.exit(1)
+    discovery = NetworkDiscovery()
+    discovery.load_from(previous)
+    ui = CursesUI(discovery, review_timestamp=previous.get("timestamp"))
+    try:
+        curses.wrapper(ui.run)
+    except KeyboardInterrupt:
+        sys.exit(130)
+    # Don't overwrite the saved file in review mode.
+
+
+_MODE_FLAGS = (
+    "--setup-sudoers",
+    "--print",
+    "--print-previous",
+    "--new-scan",
+    "--load-previous",
+)
+
+
+def main():
+    if "--help" in sys.argv or "-h" in sys.argv:
+        print(USAGE, end="")
+        return
+
+    selected = [f for f in _MODE_FLAGS if f in sys.argv]
+    if len(selected) > 1:
+        print(
+            f"Conflicting flags: {', '.join(selected)}. Pick one.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    if "--setup-sudoers" in sys.argv:
+        sys.exit(setup_sudoers())
+
+    if "--print-previous" in sys.argv:
+        previous = load_previous_run()
+        if not previous:
+            print("No previous scan on file.", file=sys.stderr)
+            sys.exit(1)
+        discovery = NetworkDiscovery()
+        discovery.load_from(previous)
+        ts = previous.get("timestamp", "unknown time")
+        print(f"Previous scan from {ts}")
+        discovery.print_results()
+        return
+
+    if "--print" in sys.argv:
+        discovery = NetworkDiscovery()
+        current_subnet = discovery._get_local_subnet()
+        ensure_manuf()
+        check_and_authorize_sudo(discovery)
+        def _print_progress(msg, key=None, final=False):
+            # On a plain stdout we can't rewrite lines, so drop the intermediate
+            # live ticks (keyed, non-final) and print only settled stage lines.
+            if key is None or final:
+                print(msg)
+        try:
+            asyncio.run(discovery.discover(timeout=3.0, on_progress=_print_progress))
+        except KeyboardInterrupt:
+            sys.exit(130)
+        discovery.print_results()
+        save_run(discovery.devices.values(), current_subnet, discovery.missing_devices)
+        return
+
+    if "--load-previous" in sys.argv:
+        _load_previous_tui(load_previous_run())
+        return
+
+    if "--new-scan" in sys.argv:
+        _run_new_scan_tui(load_previous_run())
+        return
+
+    history = list_history()
+    # ensure_manuf may print to the terminal on first run, so it must run in
+    # cooked mode before curses opens. The sudo check is deferred: it's only
+    # relevant if the user picks "New scan", and we want to avoid prompting
+    # at all when they're just reviewing a past scan.
+    ensure_manuf()
+
+    # _menu_session returns:
+    #   None                                      — user quit, or load completed
+    #   ('scan_done',          discovery, subnet) — new-scan ran in this session
+    #   ('scan_after_prompt',  discovery, subnet) — new-scan deferred so the
+    #                                                outer caller can prompt for
+    #                                                sudo in cooked mode, then
+    #                                                re-enter curses to scan.
+    def _menu_session(stdscr):
+        choice = _startup_menu(stdscr, history)
+        if choice is None:
+            return None
+        action, payload = choice
+        # Wipe the menu so the next view's first paint isn't drawn over it.
+        stdscr.erase()
+        stdscr.refresh()
+        if action == "load":
+            data = load_run(payload["path"])
+            if not data:
+                return None
+            discovery = NetworkDiscovery()
+            discovery.load_from(data)
+            CursesUI(discovery, review_timestamp=data.get("timestamp")).run(stdscr)
+            return None
+        # action == "new"
+        discovery = NetworkDiscovery()
+        current_subnet = discovery._get_local_subnet()
+        if history:
+            previous = load_run(history[0]["path"])
+            if previous and previous.get("subnet") == current_subnet:
+                discovery._pending_diff = previous
+        if _arp_sudo_status(discovery) == 'prompt':
+            # Need to ask the user for a password — must happen in cooked
+            # terminal mode, so bail out of curses and let the caller run
+            # the prompt + a fresh curses session for the scan.
+            return ('scan_after_prompt', discovery, current_subnet)
+        # Sudo is already authorized (or nothing to authorize) — run the
+        # scan in this same curses session, no flash.
+        CursesUI(discovery).run(stdscr)
+        return ('scan_done', discovery, current_subnet)
+
+    try:
+        result = curses.wrapper(_menu_session)
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+    if result is None:
+        return
+
+    kind, discovery, current_subnet = result
+    if kind == 'scan_after_prompt':
+        check_and_authorize_sudo(discovery)
+        try:
+            curses.wrapper(CursesUI(discovery).run)
+        except KeyboardInterrupt:
+            sys.exit(130)
+
+    save_run(discovery.devices.values(), current_subnet, discovery.missing_devices)
+
+
+if __name__ == "__main__":
+    main()
