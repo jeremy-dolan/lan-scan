@@ -523,6 +523,15 @@ def resolve_name(device: "Device") -> Optional[str]:
     return None
 
 
+def _manufacturer_is_redundant(manufacturer: str, model: str) -> bool:
+    """True if `model` already conveys the brand. Any shared alphanumeric word
+    means the model is probably self-sufficient; matching on whole words to
+    avoid substring false positives ("inc" and "Princeton")."""
+    mfg_words = set(re.findall(r"[a-z0-9]+", manufacturer.lower()))
+    model_words = set(re.findall(r"[a-z0-9]+", model.lower()))
+    return bool(mfg_words & model_words)
+
+
 def resolve_device_kind(device: "Device") -> str:
     """Pick the best identifier (the device's kind) for the DEVICE column.
 
@@ -548,12 +557,12 @@ def resolve_device_kind(device: "Device") -> str:
        10. [unknown device]                    — locally-administered MAC, or
                                                  OUI lookup failed"""
     if device.model:
-        if device.upnp_manufacturer and device.upnp_manufacturer.lower() not in device.model.lower():
+        if device.upnp_manufacturer and not _manufacturer_is_redundant(device.upnp_manufacturer, device.model):
             return f"{device.upnp_manufacturer} {device.model}"
         return device.model
     if device.wsd_model:
         mfg = device.wsd_manufacturer
-        if mfg and mfg.lower() not in device.wsd_model.lower():
+        if mfg and not _manufacturer_is_redundant(mfg, device.wsd_model):
             return f"{mfg} {device.wsd_model}"
         return device.wsd_model
     for key in ("model", "am", "md"):
