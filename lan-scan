@@ -2865,6 +2865,10 @@ class CursesUI:
                 self._draw_detail(stdscr)
             if self.showing_help:
                 self._draw_help(stdscr)
+            # All layers are staged in the virtual screen; push them to the
+            # terminal in one atomic update so the popup and the list appear
+            # together (no flicker of the bare list behind the popup).
+            curses.doupdate()
 
             key = stdscr.getch()
 
@@ -2949,7 +2953,10 @@ class CursesUI:
             self.scroll_offset = self.selected - list_height + 1
 
     def _draw_list(self, stdscr):
-        stdscr.clear()
+        # erase() (not clear()) wipes only the virtual buffer; curses then
+        # computes a minimal diff on doupdate instead of blanking the whole
+        # physical screen each frame. KEY_RESIZE still forces a real clear().
+        stdscr.erase()
         height, width = stdscr.getmaxyx()
 
         missing = self.discovery.missing_devices
@@ -3011,7 +3018,11 @@ class CursesUI:
             stdscr.addnstr(height - 1, 0, footer.center(width - 1), width - 1)
             stdscr.attroff(curses.color_pair(2))
 
-        stdscr.refresh()
+        # noutrefresh (not refresh) so this only stages the virtual screen
+        # without writing to the terminal. The main loop composes the list and
+        # any popup, then flushes once via curses.doupdate() — that way the
+        # popup never flashes on top of a freshly-refreshed bare list.
+        stdscr.noutrefresh()
 
     def _draw_device_row(self, stdscr, row, width, device, is_selected):
         device_kind = resolve_device_kind(device)[:30]
@@ -3362,7 +3373,8 @@ class CursesUI:
         except curses.error:
             pass
 
-        stdscr.refresh()
+        # See _draw_list: stage only, the main loop flushes with doupdate().
+        stdscr.noutrefresh()
 
     def _draw_help(self, stdscr):
         """Modal help overlay — same popup geometry as _draw_detail."""
@@ -3439,7 +3451,8 @@ class CursesUI:
         except curses.error:
             pass
 
-        stdscr.refresh()
+        # See _draw_list: stage only, the main loop flushes with doupdate().
+        stdscr.noutrefresh()
 
 
 def setup_sudoers() -> int:
