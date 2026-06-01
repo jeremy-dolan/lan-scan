@@ -3501,16 +3501,50 @@ def _arp_sudo_status(discovery: "NetworkDiscovery") -> str:
     subnet = discovery._arp_sweep_subnet()
     if not subnet:
         return 'skip'
-    # Test the exact command we'll run, without prompting. Matches both
-    # NOPASSWD entries and valid cached creds.
-    cmd = [nmap_path, "-sn", "-PR", "-oG", "-", subnet]
-    result = subprocess.run(
-        ["sudo", "-n", "-l"] + cmd,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        timeout=5,
-    )
-    return 'ok' if result.returncode == 0 else 'prompt'
+    # We must decide whether `sudo -n nmap -sn -PR -oG - <subnet>` (the exact
+    # command discover_arp runs) will succeed WITHOUT prompting for a password.
+    #
+    # Do NOT use `sudo -n -l <cmd>` for this: `sudo -l` reports whether a command
+    # is *permitted by policy*, not whether it runs *passwordless*. A blanket
+    # `(ALL) ALL` rule (the macOS admin default) makes `sudo -n -l <anything>`
+    # return 0 even though actually running it would require a password — which
+    # made this check always say 'ok' and silently skip the scan.
+    #
+    # The command runs passwordless iff either (a) credentials are already
+    # cached, or (b) a NOPASSWD entry covers this exact command.
+    try:
+        # (a) Cached credentials → any permitted command runs without a prompt.
+        if subprocess.run(
+            ["sudo", "-n", "-v"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        ).returncode == 0:
+            return 'ok'
+        # (b) No cached creds: scan the rule listing for a NOPASSWD entry that
+        # matches this exact command. `sudo -n -l` lists rules without prompting
+        # (and fails closed under -n if listing itself needs a password).
+        listing = subprocess.run(
+            ["sudo", "-n", "-l"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=5,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return 'prompt'
+    if listing.returncode == 0:
+        cmd_str = " ".join([nmap_path, "-sn", "-PR", "-oG", "-", subnet])
+        for line in listing.stdout.splitlines():
+            _, sep, rest = line.partition("NOPASSWD:")
+            if not sep:
+                continue
+            # A NOPASSWD tag may be followed by one or more comma-separated
+            # commands; match ours exactly so a stale entry for a different
+            # subnet doesn't count.
+            if any(part.strip() == cmd_str for part in rest.split(",")):
+                return 'ok'
+    return 'prompt'
 
 
 def check_and_authorize_sudo(discovery: "NetworkDiscovery") -> None:
