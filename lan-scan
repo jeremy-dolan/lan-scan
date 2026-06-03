@@ -15,6 +15,7 @@ import shutil
 import sys
 import socket
 import struct
+import textwrap
 import time
 import uuid
 import asyncio
@@ -2652,105 +2653,146 @@ def _format_probe_status(device: Device) -> list[str]:
     return lines
 
 
-def _help_lines() -> list[str]:
-    """Technical blurb shown by the '?' overlay on the device list."""
+def _help_blocks() -> list[tuple]:
+    """Structured source for the '?' overlay, reflowed by `_help_lines(width)`.
+
+    Block kinds:
+      ("blank",)        — empty spacer line.
+      ("rule", label)   — section divider; the trailing rule extends to width.
+      ("text", str)     — a prose paragraph; wrapped to the text width.
+      ("detail", str)   — prose indented two spaces under a heading; wrapped.
+      ("head", l, r)    — a heading: left label with the right column (port or
+                          method) right-aligned to width; r="" for label only.
+      ("raw", str)      — a preformatted line (the key table) kept verbatim so
+                          its hand-aligned layout survives.
+    """
     return [
-        "lan-scan — find local devices with mDNS, SSDP, and WS-Discovery",
-        "",
-        "Runs discovery protocols against the local subnet, then enriches",
-        "each discovered host with follow-up probes. Each UDP multicast",
-        "socket joins its group (IP_ADD_MEMBERSHIP) and bounded-waits for",
-        "replies. Multicast on Wi-Fi is lossy, so each query is sent",
-        "twice with a 0.3 s gap.",
-        "",
-        "── Discovery ──────────────────────────────────────────────",
-        "",
-        "mDNS / Bonjour / zeroconf            UDP 224.0.0.251 : 5353",
-        "  Sends a `_services._dns-sd._udp.local` meta-query (asks every",
-        "  responder to list all its advertised service types), plus a",
-        "  seed list of common types: _airplay._tcp, _raop._tcp (AirPlay",
-        "  audio), _hap._tcp / _homekit._tcp (HomeKit), _googlecast._tcp,",
-        "  _spotify-connect._tcp, _printer._tcp, _ipp._tcp, _smb._tcp,",
-        "  _afpovertcp._tcp, _ssh._tcp, _sftp-ssh._tcp, _device-info._tcp,",
-        "  _sonos._tcp, _soco._tcp, _http._tcp, _https._tcp. Any service",
-        "  type the meta-query surfaces that wasn't pre-listed gets a",
-        "  follow-up PTR query during the second half of the scan window.",
-        "  Used by Apple devices, Chromecast, HomeKit accessories, AirPrint",
-        "  printers, most network speakers, and anything implementing",
-        "  zeroconf.",
-        "",
-        "SSDP / UPnP discovery                UDP 239.255.255.250 : 1900",
-        "  Sends `M-SEARCH * HTTP/1.1` (HTTP-over-UDP) with two STs:",
-        "  `ssdp:all` and `upnp:rootdevice` (some devices only answer the",
-        "  narrower one). Replies carry a LOCATION header pointing at an",
-        "  XML device description, which is HTTP-fetched in the enrichment",
-        "  phase and rendered as a device/service tree in the detail popup.",
-        "  SSDP itself is just the discovery leg of UPnP. Used by routers",
-        "  / IGDs, Sonos, Roku, smart TVs, NAS boxes, media servers, and",
-        "  most \"DLNA\" gear.",
-        "",
-        "WS-Discovery                         UDP 239.255.255.250 : 3702",
-        "  Sends a SOAP-over-UDP <Probe> envelope. ProbeMatch responses",
-        "  carry qualified Types (e.g. tds:Device) and XAddrs (HTTP",
-        "  endpoint URLs for follow-up SOAP metadata queries — ONVIF",
-        "  GetDeviceInformation, etc.). Used by Windows Function Discovery,",
-        "  ONVIF IP cameras, and most networked printers/scanners.",
-        "",
-        "ARP sweep                            link-layer, local subnet",
-        "  Runs `sudo nmap -sn -PR <subnet>` to send an ARP request to",
-        "  every host on the local subnet and capture who replies.",
-        "  Catches the large class of devices that ignore all multicast",
-        "  (cheap IoT gadgets, smart plugs, doorbells) which sit silently",
-        "  on the LAN until something polls them. Requires nmap and sudo",
-        "  authorization; run `lan-scan --setup-sudoers` for passwordless",
-        "  setup. Without nmap and sudo authorization, lan-scan will skip",
-        "  the ARP sweep.",
-        "",
-        "── Enrichment (per discovered host) ───────────────────────",
-        "",
-        "UPnP device description    HTTP GET on each SSDP LOCATION URL",
-        "  Parses <friendlyName>, <manufacturer>, <modelName>, <UDN>, and",
-        "  the nested <deviceList> / <serviceList> tree. Rendered as the",
-        "  hierarchical view in the device-details popup.",
-        "",
-        "NetBIOS NBSTAT name query  UDP 137",
-        "  Returns the host's NetBIOS name list and workgroup/domain.",
-        "",
-        "HTTP banner grabs          TCP 80, 8080, 8008, 631, 443, 8443",
-        "  Connects, sends GET /, extracts the Server: header and HTML",
-        "  <title>.",
-        "",
-        "IPP Get-Printer-Attributes                            TCP 631",
-        "  On hosts that look like printers, asks for make and model,",
-        "  admin info/location, and live state. (Model is often the only",
-        "  identity source for printers that are silent on mDNS.)",
-        "",
-        "Reverse DNS",
-        "  Asks the configured resolver for a PTR record on each host's",
-        "  IP. Useful when DHCP hands out a local DNS server for devices",
-        "  to coordinate names.",
-        "",
-        "Vendor-specific pokes      (Roku, Hue, ...)",
-        "  Triggered on hosts that look like a known vendor's gear (mDNS",
-        "  service type, OUI, or SSDP model string). Roku ECP: GET",
-        "  /query/device-info on TCP 8060 for friendly name / model /",
-        "  serial. Hue: GET /api/config on TCP 80 for bridge metadata",
-        "  (model, firmware, API version, bridge ID, MAC).",
-        "",
-        "── Display ────────────────────────────────────────────────",
-        "",
-        "Devices new since the last saved run are highlighted in green;",
-        "devices missing since the last run are listed dimmed at the",
-        "bottom.",
-        "",
-        "── Keys (this view) ───────────────────────────────────────",
-        "",
-        "  ↑ ↓ / j k     navigate device list",
-        "  PgUp / PgDn   scroll text",
-        "  ENTER         open/close details",
-        "  ?             show this help",
-        "  q / ESC       back/quit",
+        ("text", "lan-scan - find local devices with mDNS, SSDP, and WS-Discovery"),
+        ("blank",),
+        ("text", "Runs discovery protocols against the local subnet, then enriches each "
+                 "discovered host with follow-up probes. Each UDP multicast socket joins "
+                 "its group (IP_ADD_MEMBERSHIP) and bounded-waits for replies. Multicast "
+                 "on Wi-Fi is lossy, so each query is sent twice with a 0.3 s gap."),
+        ("blank",),
+        ("rule", "Discovery"),
+        ("blank",),
+        ("head", "mDNS / Bonjour / zeroconf", "UDP 224.0.0.251:5353"),
+        ("detail", "Sends a `_services._dns-sd._udp.local` meta-query (asks every responder "
+                   "to list all its advertised service types), plus a seed list of common "
+                   "types: _airplay._tcp, _raop._tcp (AirPlay audio), _hap._tcp / "
+                   "_homekit._tcp (HomeKit), _googlecast._tcp, _spotify-connect._tcp, "
+                   "_printer._tcp, _ipp._tcp, _smb._tcp, _afpovertcp._tcp, _ssh._tcp, "
+                   "_sftp-ssh._tcp, _device-info._tcp, _sonos._tcp, _soco._tcp, _http._tcp, "
+                   "_https._tcp. Any service type the meta-query surfaces that wasn't "
+                   "pre-listed gets a follow-up PTR query during the second half of the "
+                   "scan window. Used by Apple devices, Chromecast, HomeKit accessories, "
+                   "AirPrint printers, most network speakers, and anything implementing "
+                   "zeroconf."),
+        ("blank",),
+        ("head", "SSDP / UPnP discovery", "UDP 239.255.255.250:1900"),
+        ("detail", "Sends `M-SEARCH * HTTP/1.1` (HTTP-over-UDP) with two STs: `ssdp:all` and "
+                   "`upnp:rootdevice` (some devices only answer the narrower one). Replies "
+                   "carry a LOCATION header pointing at an XML device description, which is "
+                   "HTTP-fetched in the enrichment phase and rendered as a device/service "
+                   "tree in the detail popup. SSDP itself is just the discovery leg of "
+                   "UPnP. Used by routers / IGDs, Sonos, Roku, smart TVs, NAS boxes, media "
+                   "servers, and most \"DLNA\" gear."),
+        ("blank",),
+        ("head", "WS-Discovery", "UDP 239.255.255.250:3702"),
+        ("detail", "Sends a SOAP-over-UDP <Probe> envelope. ProbeMatch responses carry "
+                   "qualified Types (e.g. tds:Device) and XAddrs (HTTP endpoint URLs for "
+                   "follow-up SOAP metadata queries — ONVIF GetDeviceInformation, etc.). "
+                   "Used by Windows Function Discovery, ONVIF IP cameras, and most "
+                   "networked printers/scanners."),
+        ("blank",),
+        ("head", "ARP sweep", "link-layer, local subnet"),
+        ("detail", "Runs `sudo nmap -sn -PR <subnet>` to send an ARP request to every host "
+                   "on the local subnet and capture who replies. Catches the large class "
+                   "of devices that ignore all multicast (cheap IoT gadgets, smart plugs, "
+                   "doorbells) which sit silently on the LAN until something polls them. "
+                   "Requires nmap and sudo authorization; run `lan-scan --setup-sudoers` "
+                   "for passwordless setup; without nmap and sudo authorization, lan-scan "
+                   "will skip the ARP sweep."),
+        ("blank",),
+        ("rule", "Enrichment (per discovered host)"),
+        ("blank",),
+        ("head", "UPnP device description", "HTTP GET on each SSDP LOCATION URL"),
+        ("detail", "Parses <friendlyName>, <manufacturer>, <modelName>, <UDN>, and the "
+                   "nested <deviceList> / <serviceList> tree. Rendered as the hierarchical "
+                   "view in the device-details popup."),
+        ("blank",),
+        ("head", "NetBIOS NBSTAT name query", "UDP 137"),
+        ("detail", "Returns the host's NetBIOS name list and workgroup/domain."),
+        ("blank",),
+        ("head", "HTTP banner grabs", "TCP 80, 8080, 8008, 631, 443, 8443"),
+        ("detail", "Connects, sends GET /, extracts the Server: header and HTML <title>."),
+        ("blank",),
+        ("head", "IPP Get-Printer-Attributes", "TCP 631"),
+        ("detail", "On hosts that look like printers, asks for make and model, admin "
+                   "info/location, and live state. (Model is often the only identity "
+                   "source for printers that are silent on mDNS.)"),
+        ("blank",),
+        ("head", "Reverse DNS", ""),
+        ("detail", "Asks the configured resolver for a PTR record on each host's IP. Useful "
+                   "when DHCP hands out a local DNS server for devices to coordinate names."),
+        ("blank",),
+        ("head", "Vendor-specific pokes", "(Roku, Hue, ...)"),
+        ("detail", "Triggered on hosts that look like a known vendor's gear (mDNS service "
+                   "type, OUI, or SSDP model string). Roku ECP: GET /query/device-info on "
+                   "TCP 8060 for friendly name / model / serial. Hue: GET /api/config on "
+                   "TCP 80 for bridge metadata (model, firmware, API version, bridge ID, "
+                   "MAC)."),
+        ("blank",),
+        ("rule", "Display"),
+        ("blank",),
+        ("text", "Devices new since the last saved run are highlighted in green; devices "
+                 "missing since the last run are listed dimmed at the bottom."),
+        ("blank",),
+        ("rule", "Keys (this view)"),
+        ("blank",),
+        ("raw", "  ↑ ↓ / j k     navigate device list"),
+        ("raw", "  PgUp / PgDn   scroll text"),
+        ("raw", "  ENTER         open/close details"),
+        ("raw", "  ?             show this help"),
+        ("raw", "  q / ESC       back/quit"),
     ]
+
+
+def _help_lines(width: int) -> list[str]:
+    """Render the '?' overlay to display lines reflowed to `width` columns.
+
+    Prose blocks wrap to `width`; section dividers extend their rule to `width`;
+    preformatted lines pass through and are clipped to `width` by the caller if
+    too wide.
+    """
+    width = max(1, width)
+    out: list[str] = []
+    for block in _help_blocks():
+        kind = block[0]
+        if kind == "blank":
+            out.append("")
+        elif kind == "rule":
+            head = f"── {block[1]} "
+            out.append(head + "─" * max(0, width - len(head)))
+        elif kind == "head":
+            left, right = block[1], block[2]
+            if not right:
+                out.append(left)
+            else:
+                gap = width - len(left) - len(right)
+                out.append(left + " " * max(2, gap) + right)
+        elif kind == "raw":
+            out.append(block[1])
+        elif kind == "text":
+            out.extend(textwrap.wrap(block[1], width) or [""])
+        elif kind == "detail":
+            # Inset on both sides: a 2-space left indent plus a single column of
+            # right margin (wrap 1 column narrower than the full width).
+            out.extend(textwrap.wrap(
+                block[1], max(1, width - 1),
+                initial_indent="  ", subsequent_indent="  ",
+            ) or [""])
+    return out
 
 
 class CursesUI:
@@ -3424,13 +3466,25 @@ class CursesUI:
         except curses.error:
             pass
 
-        lines = _help_lines()
+        lines = _help_lines(content_w)
         max_scroll = max(0, len(lines) - content_height)
         self.help_scroll = min(self.help_scroll, max_scroll)
 
         for i, line in enumerate(lines[self.help_scroll:self.help_scroll + content_height]):
             row = content_top + i
             try:
+                # The program name leading the very first line is bold. Drawing
+                # an attribute doesn't shift columns, so the wrap is unaffected.
+                if self.help_scroll + i == 0 and line.startswith("lan-scan"):
+                    name = "lan-scan"
+                    stdscr.attron(curses.A_BOLD)
+                    stdscr.addnstr(row, content_left, name, content_w)
+                    stdscr.attroff(curses.A_BOLD)
+                    rest = line[len(name):content_w]
+                    if rest:
+                        stdscr.addnstr(row, content_left + len(name), rest,
+                                       content_w - len(name))
+                    continue
                 is_section = line.startswith("── ")
                 if is_section:
                     stdscr.attron(curses.color_pair(2))

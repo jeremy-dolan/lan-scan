@@ -7,11 +7,11 @@ sweep, then enriches each device with UPnP device descriptions, HTTP banners,
 NetBIOS NBSTAT, IPP Get-Printer-Attributes, reverse DNS, and a few
 vendor-specific pokes (Roku, Philips Hue, ...). Results are browseable in a
 curses TUI or can be printed to stdout; scans are cached for later review and
-for highlighting differences across scans.
+for highlighting differences between scans.
 
 ## Requirements
 
-- Python 3 (standard library only)
+- Python 3 (standard library only!)
 - Optional: `sudo` + `nmap` for active ARP sweep (see below)
 - Optional: Internet access to download MAC address OUI database (one time)
 
@@ -69,7 +69,7 @@ Runs `sudo nmap -sn -PR <subnet>` to send an ARP request to every host on the
 local subnet and capture who replies. Catches the large class of devices that
 ignore all multicast (cheap IoT gadgets, smart plugs, doorbells) which sit
 silently on the LAN until something polls them. Requires `nmap` and `sudo`
-authorization; run `lan-scan --setup-sudoers` for passwordless setup. Without
+authorization; run `lan-scan --setup-sudoers` for passwordless setup; without
 nmap and sudo authorization, lan-scan will skip the ARP sweep.
 
 ### Enrichment (per discovered host)
