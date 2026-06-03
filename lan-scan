@@ -42,6 +42,12 @@ HISTORY_MAX = 50
 # addresses.
 ARP_SWEEP_MAX_PREFIX = 22
 
+# Regex for `sudo nmap` args for passwordless scans (advertised in --setup-sudoers)
+# sudo (>= 1.9.10) matches the entire arg string as one regex when it begins with ^
+# THIS MUST STAY IN SYNC WITH THE COMMAND DISCOVER_ARP ACTUALLY RUNS
+# Note [.] is a single literal dot (a dot in brackets isn't special)
+ARP_SUDOERS_ARGS = r"^-sn -PR -oG - [0-9]{1,3}([.][0-9]{1,3}){3}/[0-9]{1,2}$"
+
 
 @dataclass
 class Device:
@@ -2113,10 +2119,7 @@ class NetworkDiscovery:
 
     def _arp_sweep_subnet(self) -> Optional[str]:
         """The CIDR handed to the nmap ARP sweep (capped — see _detect_subnet).
-
-        This value is also baked into the sudoers NOPASSWD entry, so every call
-        site that builds the nmap command must go through here (or _detect_subnet)
-        or `sudo -n` won't match the command and the sweep fails."""
+        Must be a plain dotted-quad to match sudoers regex (ARP_SUDOERS_ARGS)"""
         detected = self._detect_subnet()
         return detected[1] if detected else None
 
@@ -3465,53 +3468,49 @@ def setup_sudoers() -> int:
         print("    brew install nmap")
         return 1
 
-    subnet = NetworkDiscovery()._arp_sweep_subnet()
-    if not subnet:
-        print("Could not determine local subnet (no network connection?).")
-        return 1
-
     user = getpass.getuser()
-    entry = f"{user} ALL=(root) NOPASSWD: {nmap_path} -sn -PR -oG - {subnet}"
+    entry = f"{user} ALL=(root) NOPASSWD: {nmap_path} {ARP_SUDOERS_ARGS}"
     sudoers_file = "/etc/sudoers.d/lan-scan"
 
-    print("To enable active ARP discovery without password prompts, add this sudoers entry:")
+    print("To enable active ARP discovery without sudo prompting for a password every scan,")
+    print("add the following line as a sudoers entry:")
     print()
-    print(f"  {entry}")
+    print(entry)
     print()
-    print(f"This can be placed in, e.g.: {sudoers_file}")
+    print(f"This can be placed in, e.g.: {sudoers_file}, with:")
+    print(f"  sudo visudo -f {sudoers_file}")
     print()
-    print(f"Note: {subnet} is hardcoded into this authorization, so other subnets")
-    print("will still require manual authorization (or re-run --setup-sudoers).")
+    print("The regular expression matches any IPv4 subnet.")
+    print("Regex matching in sudoers requires sudo 1.9.10 or newer.")
     return 0
 
 
-def _arp_sudo_status(discovery: "NetworkDiscovery") -> str:
-    """Silent check of whether the ARP-scan sudo invocation is already authorized.
+def _arp_requires_sudo_passwd_auth(discovery: "NetworkDiscovery") -> bool:
+    """Silent check: would the ARP-scan sudo invocation prompt for a password?
 
-    Returns:
-      'ok'     — cached creds or NOPASSWD entry; sudo will not prompt.
-      'prompt' — sudo would prompt for a password; caller may decide whether
-                 to interactively prompt now.
-      'skip'   — nothing to authorize (nmap not installed, or no local subnet).
-                 ARP scan will be skipped regardless.
+    True  — sudo would prompt; authorize interactively (cooked mode, before
+            curses) so the scan's `sudo -n` later finds cached credentials.
+    False — no prompt needed: runs passwordless (creds cached or NOPASSWD
+            entry), or nothing to authorize (nmap missing / no subnet, in
+            which case discover_arp skips the sweep and reports why).
     """
     nmap_path = shutil.which("nmap")
     if not nmap_path:
-        return 'skip'
+        return False
     subnet = discovery._arp_sweep_subnet()
     if not subnet:
-        return 'skip'
+        return False
     # We must decide whether `sudo -n nmap -sn -PR -oG - <subnet>` (the exact
     # command discover_arp runs) will succeed WITHOUT prompting for a password.
     #
-    # Do NOT use `sudo -n -l <cmd>` for this: `sudo -l` reports whether a command
-    # is *permitted by policy*, not whether it runs *passwordless*. A blanket
-    # `(ALL) ALL` rule (the macOS admin default) makes `sudo -n -l <anything>`
-    # return 0 even though actually running it would require a password — which
-    # made this check always say 'ok' and silently skip the scan.
+    # Do NOT use `sudo -n -l <cmd>` for this: `sudo -l` simply echos the policy
+    # line that would be used for matching this command to policies, rather than
+    # checking the command against those polices.
     #
-    # The command runs passwordless iff either (a) credentials are already
-    # cached, or (b) a NOPASSWD entry covers this exact command.
+    # The command runs passwordless iff either:
+    # (a) Credentials are already cached. Checked (and refreshed) with sudo -n -v
+    # or
+    # (b) The --setup-sudoers recipe is installed. (We only look for that exact recipe.)
     try:
         # (a) Cached credentials → any permitted command runs without a prompt.
         if subprocess.run(
@@ -3520,10 +3519,10 @@ def _arp_sudo_status(discovery: "NetworkDiscovery") -> str:
             stderr=subprocess.DEVNULL,
             timeout=5,
         ).returncode == 0:
-            return 'ok'
-        # (b) No cached creds: scan the rule listing for a NOPASSWD entry that
-        # matches this exact command. `sudo -n -l` lists rules without prompting
-        # (and fails closed under -n if listing itself needs a password).
+            return False
+        # (b) No cached creds: scan the rule listing for our NOPASSWD recipe.
+        # `sudo -n -l` lists rules without prompting (and fails closed under -n
+        # if listing itself needs a password).
         listing = subprocess.run(
             ["sudo", "-n", "-l"],
             stdout=subprocess.PIPE,
@@ -3532,26 +3531,23 @@ def _arp_sudo_status(discovery: "NetworkDiscovery") -> str:
             timeout=5,
         )
     except (subprocess.TimeoutExpired, OSError):
-        return 'prompt'
+        # Can't reach sudo to probe, so we can't prompt either; discover_arp
+        # will attempt its `sudo -n` and report the skip if it can't run.
+        return False
     if listing.returncode == 0:
-        cmd_str = " ".join([nmap_path, "-sn", "-PR", "-oG", "-", subnet])
+        recipe = f"{nmap_path} {ARP_SUDOERS_ARGS}"
         for line in listing.stdout.splitlines():
             _, sep, rest = line.partition("NOPASSWD:")
-            if not sep:
-                continue
-            # A NOPASSWD tag may be followed by one or more comma-separated
-            # commands; match ours exactly so a stale entry for a different
-            # subnet doesn't count.
-            if any(part.strip() == cmd_str for part in rest.split(",")):
-                return 'ok'
-    return 'prompt'
+            if sep and recipe in rest:
+                return False
+    return True
 
 
 def check_and_authorize_sudo(discovery: "NetworkDiscovery") -> None:
     """If sudo for the ARP scan isn't already authorized, prompt the user
     interactively (in cooked terminal mode) to authorize it. No-op when
     already authorized or when there's nothing to authorize."""
-    if _arp_sudo_status(discovery) != 'prompt':
+    if not _arp_requires_sudo_passwd_auth(discovery):
         return
 
     nmap_path = shutil.which("nmap")
@@ -3561,8 +3557,7 @@ def check_and_authorize_sudo(discovery: "NetworkDiscovery") -> None:
     print("Active ARP discovery (recommended) requires sudo to run the command:")
     print(f"    sudo {nmap_path} -sn -PR -oG - {subnet}")
     print()
-    print("For permanent passwordless setup, run:")
-    print(f"    python3 {sys.argv[0]} --setup-sudoers")
+    print("For passwordless setup, see `lan-scan --setup-sudoers`")
     print()
     try:
         response = input("Authorize sudo now? [Y/n] (will prompt for password) ").strip().lower()
@@ -3819,7 +3814,7 @@ def main():
             previous = load_run(history[0]["path"])
             if previous and previous.get("subnet") == current_subnet:
                 discovery._pending_diff = previous
-        if _arp_sudo_status(discovery) == 'prompt':
+        if _arp_requires_sudo_passwd_auth(discovery):
             # Need to ask the user for a password — must happen in cooked
             # terminal mode, so bail out of curses and let the caller run
             # the prompt + a fresh curses session for the scan.
