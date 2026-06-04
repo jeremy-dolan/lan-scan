@@ -31,7 +31,7 @@ render-time name/kind resolution).
 ## Prerequisites
 
 ```bash
-tmux -V          # tmux 3.6b — driver needs it (brew install tmux on macOS)
+tmux -V            # tmux 3.6b — driver needs it (brew install tmux on macOS)
 python3 --version  # 3.14.5 here; needs a modern Python 3 (uses dict[str,int] syntax)
 ```
 
@@ -67,7 +67,7 @@ hand or add steps, the key sequence is: arrows / `j`/`k` move the selection,
 ### tmux one-liner (manual poke)
 
 ```bash
-S=lanscan; tmux new-session -d -s $S -x 120 -y 40
+S=lanscan; tmux new-session -d -s $S -x 100 -y 30
 tmux send-keys -t $S "$PWD/lan-scan --load-previous" Enter; sleep 3
 tmux capture-pane -t $S -p          # see the device list
 tmux send-keys -t $S Down Down Enter; sleep 1
@@ -128,9 +128,12 @@ scan from a stdout, `./lan-scan --print`.
 - **The popup overlays the list, it doesn't replace it.** In a captured screen
   the popup box is drawn *on top of* the device rows, so each line reads like
   `192.168.1.┌── Device Details …`. That's correct rendering, not corruption.
-- **Pane width matters.** The driver uses 120×40. Narrower and the DEVICE column
-  truncates (e.g. `Signify Philips hue bridge 201`); the detail/help popups size
-  to the terminal, so a tiny pane clips them.
+- **Terminal width matters.** The driver defaults to 100×30; override with the
+  `COLS` / `LINES` env vars (`COLS=80 LINES=50 ./smoke.sh`) to exercise
+  width-dependent rendering. The two popups handle a narrow terminal
+  differently: the detail popup **truncates** long lines to the width, while
+  the help popup **word-wraps** its prose to fit (only its preformatted key
+  table can clip).
 - **`--setup-sudoers` is subnet-agnostic.** The emitted sudoers line matches the
   nmap args with a regex (`ARP_SUDOERS_ARGS`), so it keeps working across subnet
   changes — no regeneration needed. The regex match requires sudo >= 1.9.10.
@@ -143,6 +146,7 @@ scan from a stdout, `./lan-scan --print`.
   coreutils). The driver doesn't use it; if you add it, install coreutils or use
   `gtimeout`.
 - `FAIL: tmux not installed` — `brew install tmux`.
-- Detail popup doesn't open in a manual run — make sure the pane is ≥ ~40 rows
-  and you waited ~1s after `Down Down Enter`; the curses getch is blocking but
-  send-keys is async, so give it a beat before `capture-pane`.
+- Detail popup doesn't open in a manual run — wait ~1s after `Down Down Enter`
+  before `capture-pane`. `send-keys` returns the instant it queues the keys; it
+  doesn't wait for the app to wake from its blocking getch, handle them, and
+  repaint, so an immediate capture races the redraw and grabs the old screen.

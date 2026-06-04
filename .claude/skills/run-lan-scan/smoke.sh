@@ -26,6 +26,10 @@ ROOT="$(cd "$HERE/../../.." && pwd)"
 BIN="$ROOT/lan-scan"
 OUT="${OUT:-$ROOT/untracked-lan-scan-smoke}"
 S="lanscan_smoke_$$"
+# Terminal geometry. Override to exercise width-dependent rendering:
+#   COLS=80 LINES=50 ./smoke.sh
+COLS="${COLS:-100}"
+LINES="${LINES:-30}"
 
 [ -x "$BIN" ] || { echo "FAIL: $BIN not found/executable" >&2; exit 1; }
 command -v tmux >/dev/null || { echo "FAIL: tmux not installed (brew install tmux)" >&2; exit 1; }
@@ -40,9 +44,9 @@ trap cleanup EXIT
 
 cap() { tmux capture-pane -t "$S" -p > "$OUT/$1"; echo "  captured $OUT/$1"; }
 
-echo "== launching TUI in review mode (tmux 120x40) =="
+echo "== launching TUI in review mode (tmux ${COLS}x${LINES}) =="
 tmux kill-session -t "$S" 2>/dev/null || true
-tmux new-session -d -s "$S" -x 120 -y 40
+tmux new-session -d -s "$S" -x "$COLS" -y "$LINES"
 tmux send-keys -t "$S" "$BIN --load-previous" Enter
 sleep 3
 
