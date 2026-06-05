@@ -925,10 +925,9 @@ class NetworkDiscovery:
         self._mdns_new_service_types: set[str] = set()
 
         async def send_batch(qnames: list[str]):
-            """Send each query twice with a 0.3 s gap between passes —
-            matches the SSDP/WS-D retry pattern to survive lossy Wi-Fi
-            multicast. Runs as a background task while the main loop
-            drains responses in parallel."""
+            """Send each query twice with a 0.3 s gap between passes to
+            survive lossy Wi-Fi multicast. Runs as a background task while
+            the main loop drains responses in parallel."""
             pkts = [self._build_mdns_query(q) for q in qnames]
             for _ in range(2):
                 for pkt in pkts:
@@ -1195,7 +1194,10 @@ class NetworkDiscovery:
                         f"ST: {st}\r\n"
                         "\r\n"
                     )
-                    sock.sendto(message.encode(), (SSDP_ADDR, SSDP_PORT))
+                    try:
+                        sock.sendto(message.encode(), (SSDP_ADDR, SSDP_PORT))
+                    except OSError:
+                        pass
                 await asyncio.sleep(0.3)
 
         send_task = asyncio.create_task(send_searches())
@@ -1246,7 +1248,6 @@ class NetworkDiscovery:
         ).encode()
 
         async def send_probes():
-            # Multicast on Wi-Fi is lossy; send twice (matches SSDP / mDNS).
             for _ in range(2):
                 try:
                     sock.sendto(probe, (WSD_ADDR, WSD_PORT))
@@ -3275,8 +3276,8 @@ class CursesUI:
                 first = False
 
         # WS-Discovery services live here as a compact line; mDNS services
-        # have moved into the dedicated `── mDNS ──` section below alongside
-        # their TXT records. SSDP services are omitted here entirely — when
+        # live in the dedicated `── mDNS ──` section below alongside their
+        # TXT records. SSDP services are omitted here entirely — when
         # present, they're shown as a hierarchical device/service tree in
         # the UPnP Device Description section below.
         if device.wsd_services:
