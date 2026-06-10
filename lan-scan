@@ -3031,10 +3031,10 @@ class CursesUI:
 
         missing = self.discovery.missing_devices
 
-        # Rows 0–1 — column header + rule; separators at byte positions 16 and 49.
-        header = f"{'ADDRESS':<15} │ {'DEVICE':<30} │ NAME"
+        # Rows 0–1 — column header + rule; separators at byte positions 17 and 50.
+        header = f" {'ADDRESS':<15} │ {'DEVICE':<30} │ NAME"
         rule_chars = ["─"] * (width - 1)
-        for col in (16, 49):
+        for col in (17, 50):
             if col < len(rule_chars):
                 rule_chars[col] = "┼"
         stdscr.attron(curses.color_pair(2) | curses.A_BOLD)
@@ -3097,11 +3097,11 @@ class CursesUI:
     def _draw_device_row(self, stdscr, row, width, device, is_selected):
         device_kind = resolve_device_kind(device)[:30]
         name = (resolve_name(device) or "")
-        max_name_len = width - 50
+        max_name_len = width - 51
         if len(name) > max_name_len:
             name = name[:max_name_len - 3] + "..."
 
-        line = f"{device.address:<15} │ {device_kind:<30} │ {name}"
+        line = f" {device.address:<15} │ {device_kind:<30} │ {name}"
 
         if is_selected:
             pair = curses.color_pair(5) if device.is_new else curses.color_pair(1)
@@ -3111,7 +3111,7 @@ class CursesUI:
         else:
             row_attr = curses.color_pair(4) if device.is_new else 0
             segments = [
-                (f"{device.address:<15} ", row_attr),
+                (f" {device.address:<15} ", row_attr),
                 ("│", curses.color_pair(2)),
                 (f" {device_kind:<30} ", row_attr),
                 ("│", curses.color_pair(2)),
@@ -3134,10 +3134,10 @@ class CursesUI:
         ghost = _device_from_dict(m)
         device_kind = resolve_device_kind(ghost)[:30]
         name = (resolve_name(ghost) or "")
-        max_name_len = width - 50
+        max_name_len = width - 51
         if len(name) > max_name_len:
             name = name[:max_name_len - 3] + "..."
-        line = f"{m['address']:<15} │ {device_kind:<30} │ {name}"
+        line = f" {m['address']:<15} │ {device_kind:<30} │ {name}"
         stdscr.attron(curses.A_DIM)
         stdscr.addnstr(row, 0, line, width - 1)
         stdscr.attroff(curses.A_DIM)
