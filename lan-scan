@@ -2933,6 +2933,10 @@ class CursesUI:
                 elif key == curses.KEY_NPAGE:
                     page = max(1, stdscr.getmaxyx()[0] - 3)
                     self.help_scroll += page  # clamped in _draw_help
+                elif key == curses.KEY_HOME:
+                    self.help_scroll = 0
+                elif key == curses.KEY_END:
+                    self.help_scroll = sys.maxsize  # clamped in _draw_help
                 elif key == curses.KEY_RESIZE:
                     stdscr.clear()
                 continue
@@ -2973,10 +2977,30 @@ class CursesUI:
                 if self.showing_detail:
                     page = max(1, stdscr.getmaxyx()[0] - 3)
                     self.detail_scroll = max(0, self.detail_scroll - page)
+                else:
+                    page = max(1, stdscr.getmaxyx()[0] - 4)  # list rows per page
+                    self.selected = max(0, self.selected - page)
+                    self._adjust_scroll(stdscr)
             elif key == curses.KEY_NPAGE:
                 if self.showing_detail:
                     page = max(1, stdscr.getmaxyx()[0] - 3)
                     self.detail_scroll += page  # clamped to max_scroll in _draw_detail
+                else:
+                    page = max(1, stdscr.getmaxyx()[0] - 4)  # list rows per page
+                    self.selected = min(len(self.devices) - 1, self.selected + page)
+                    self._adjust_scroll(stdscr)
+            elif key == curses.KEY_HOME:
+                if self.showing_detail:
+                    self.detail_scroll = 0
+                else:
+                    self.selected = 0
+                    self._adjust_scroll(stdscr)
+            elif key == curses.KEY_END:
+                if self.showing_detail:
+                    self.detail_scroll = sys.maxsize  # clamped in _draw_detail
+                else:
+                    self.selected = max(0, len(self.devices) - 1)
+                    self._adjust_scroll(stdscr)
             elif key == ord('\n') or key == curses.KEY_ENTER:
                 if self.showing_detail:
                     self.showing_detail = False
