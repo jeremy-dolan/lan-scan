@@ -760,7 +760,8 @@ def _run_summary(n_devices: int, subnet: Optional[str], timestamp: Optional[str]
     bar, e.g. '26 devices (15 new, 11 missing) on 192.168.1.0/24 at 1:25 PM,
     May 26'. The new/missing breakdown is only passed for a live scan. With
     align (the menu's multi-row listing), the device count is right-aligned to
-    width 3 and the hour to width 2 so the rows line up into columns."""
+    width 3, the subnet left-aligned to the widest CIDR, and the hour to width 2
+    so the rows line up into columns."""
     count = f"{n_devices:>3}" if align else str(n_devices)
     summary = f"{count} {plural(n_devices, 'device')}"
     breakdown = []
@@ -770,7 +771,10 @@ def _run_summary(n_devices: int, subnet: Optional[str], timestamp: Optional[str]
         breakdown.append(f"{missing} missing")
     if breakdown:
         summary += " (" + ", ".join(breakdown) + ")"
-    summary += f" on {subnet or '?'}"
+    net = subnet or "?"
+    if align:
+        net = net.ljust(len("255.255.255.255/32"))  # widest IPv4 CIDR
+    summary += f" on {net}"
     if timestamp:
         summary += f" at {_friendly_time(timestamp, pad_hour=align)}"
     return summary
@@ -3676,19 +3680,28 @@ def _startup_menu(stdscr, history: list[dict]) -> Optional[tuple[str, Optional[d
 
     selectable = [i for i, item in enumerate(items) if item[0] != "separator"]
     cur = 0  # index into `selectable`
+    top = 0  # first visible index into `items` (scroll offset)
 
     while True:
         stdscr.clear()
         height, width = stdscr.getmaxyx()
+
+        # Body occupies rows 2 .. height-2 (row 0 header, height-1 footer).
+        n_visible = max(1, height - 3)
+        sel_item = selectable[cur]
+        if sel_item < top:
+            top = sel_item
+        elif sel_item >= top + n_visible:
+            top = sel_item - n_visible + 1
 
         stdscr.attron(curses.color_pair(2) | curses.A_BOLD)
         stdscr.addnstr(0, 0, "lan-scan", width - 1)
         stdscr.attroff(curses.color_pair(2) | curses.A_BOLD)
 
         for i, (kind, text, _) in enumerate(items):
-            row = i + 2
-            if row >= height - 1:
-                break
+            if i < top or i >= top + n_visible:
+                continue
+            row = (i - top) + 2
             try:
                 if kind == "separator":
                     stdscr.attron(curses.color_pair(2))
@@ -3724,6 +3737,14 @@ def _startup_menu(stdscr, history: list[dict]) -> Optional[tuple[str, Optional[d
             cur = max(0, cur - 1)
         elif key in (curses.KEY_DOWN, ord('j')):
             cur = min(len(selectable) - 1, cur + 1)
+        elif key == curses.KEY_PPAGE:
+            cur = max(0, cur - n_visible)
+        elif key == curses.KEY_NPAGE:
+            cur = min(len(selectable) - 1, cur + n_visible)
+        elif key == curses.KEY_HOME:
+            cur = 0
+        elif key == curses.KEY_END:
+            cur = len(selectable) - 1
         elif key in (10, 13, curses.KEY_ENTER):
             kind, _, payload = items[selectable[cur]]
             if kind == "new":
