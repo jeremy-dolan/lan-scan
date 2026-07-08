@@ -3026,6 +3026,19 @@ class CursesUI:
         elif self.selected >= self.scroll_offset + list_height:
             self.scroll_offset = self.selected - list_height + 1
 
+    # ADDRESS is fixed at the longest possible IPv4 literal; DEVICE and NAME
+    # split any width beyond/short of the 80-col baseline equally between them.
+    ADDR_W = 15
+    _BASE_TERM_W = 80
+    _BASE_DEVICE_W = 30
+
+    @classmethod
+    def _column_widths(cls, width):
+        delta = width - cls._BASE_TERM_W
+        device_w = max(cls._BASE_DEVICE_W + delta // 2, 10)
+        name_w = max(width - 8 - cls.ADDR_W - device_w, 0)
+        return cls.ADDR_W, device_w, name_w
+
     def _draw_list(self, stdscr):
         # erase() (not clear()) wipes only the virtual buffer; curses then
         # computes a minimal diff on doupdate instead of blanking the whole
@@ -3035,10 +3048,14 @@ class CursesUI:
 
         missing = self.discovery.missing_devices
 
-        # Rows 0–1 — column header + rule; separators at byte positions 17 and 50.
-        header = f" {'ADDRESS':<15} │ {'DEVICE':<30} │ NAME"
+        addr_w, device_w, _ = self._column_widths(width)
+        sep1 = addr_w + 2
+        sep2 = sep1 + device_w + 3
+
+        # Rows 0–1 — column header + rule; separators at the DEVICE column edges.
+        header = f" {'ADDRESS':<{addr_w}} │ {'DEVICE':<{device_w}} │ NAME"
         rule_chars = ["─"] * (width - 1)
-        for col in (17, 50):
+        for col in (sep1, sep2):
             if col < len(rule_chars):
                 rule_chars[col] = "┼"
         stdscr.attron(curses.color_pair(2) | curses.A_BOLD)
@@ -3099,13 +3116,13 @@ class CursesUI:
         stdscr.noutrefresh()
 
     def _draw_device_row(self, stdscr, row, width, device, is_selected):
-        device_kind = resolve_device_kind(device)[:30]
+        addr_w, device_w, name_w = self._column_widths(width)
+        device_kind = resolve_device_kind(device)[:device_w]
         name = (resolve_name(device) or "")
-        max_name_len = width - 51
-        if len(name) > max_name_len:
-            name = name[:max_name_len - 3] + "..."
+        if len(name) > name_w:
+            name = name[:max(name_w - 3, 0)] + "..."
 
-        line = f" {device.address:<15} │ {device_kind:<30} │ {name}"
+        line = f" {device.address:<{addr_w}} │ {device_kind:<{device_w}} │ {name}"
 
         if is_selected:
             pair = curses.color_pair(5) if device.is_new else curses.color_pair(1)
@@ -3115,9 +3132,9 @@ class CursesUI:
         else:
             row_attr = curses.color_pair(4) if device.is_new else 0
             segments = [
-                (f" {device.address:<15} ", row_attr),
+                (f" {device.address:<{addr_w}} ", row_attr),
                 ("│", curses.color_pair(2)),
-                (f" {device_kind:<30} ", row_attr),
+                (f" {device_kind:<{device_w}} ", row_attr),
                 ("│", curses.color_pair(2)),
                 (f" {name}", row_attr),
             ]
@@ -3136,12 +3153,12 @@ class CursesUI:
         # m is a raw saved device dict from the previous run. Rehydrate so the
         # same resolvers feed both current and missing rows.
         ghost = _device_from_dict(m)
-        device_kind = resolve_device_kind(ghost)[:30]
+        addr_w, device_w, name_w = self._column_widths(width)
+        device_kind = resolve_device_kind(ghost)[:device_w]
         name = (resolve_name(ghost) or "")
-        max_name_len = width - 51
-        if len(name) > max_name_len:
-            name = name[:max_name_len - 3] + "..."
-        line = f" {m['address']:<15} │ {device_kind:<30} │ {name}"
+        if len(name) > name_w:
+            name = name[:max(name_w - 3, 0)] + "..."
+        line = f" {m['address']:<{addr_w}} │ {device_kind:<{device_w}} │ {name}"
         stdscr.attron(curses.A_DIM)
         stdscr.addnstr(row, 0, line, width - 1)
         stdscr.attroff(curses.A_DIM)
