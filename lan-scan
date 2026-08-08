@@ -2180,6 +2180,49 @@ class NetworkDiscovery:
             return None
         return prefix
 
+    def scan_header_text(self) -> str:
+        """'Scanning...' annotated with the local interface/IP, when available."""
+        local_ip = self._get_local_ip()
+        local_iface = self._get_local_interface()
+        if local_ip and local_iface:
+            return f"Scanning on device {local_iface} ({local_ip})..."
+        elif local_ip:
+            return f"Scanning... ({local_ip})"
+        return "Scanning..."
+
+    def _get_local_interface(self) -> Optional[str]:
+        """Name of the interface used for the default outbound route (the
+        same route _get_local_ip() resolves), for display purposes. No
+        packets are sent -- these are pure route-table lookups. Returns None
+        if it can't be determined."""
+        # Linux: `ip route get 8.8.8.8` -> "8.8.8.8 via 192.168.1.1 dev eth0 src ..."
+        ip_path = shutil.which("ip")
+        if ip_path:
+            try:
+                out = subprocess.run(
+                    [ip_path, "route", "get", "8.8.8.8"],
+                    capture_output=True, text=True, timeout=2.0,
+                ).stdout
+                m = re.search(r"\bdev\s+(\S+)", out)
+                if m:
+                    return m.group(1)
+            except Exception:
+                pass
+        # macOS/BSD: `route get 8.8.8.8` -> "... interface: en0 ..."
+        route_path = shutil.which("route")
+        if route_path:
+            try:
+                out = subprocess.run(
+                    [route_path, "get", "8.8.8.8"],
+                    capture_output=True, text=True, timeout=2.0,
+                ).stdout
+                m = re.search(r"interface:\s*(\S+)", out)
+                if m:
+                    return m.group(1)
+            except Exception:
+                pass
+        return None
+
     async def discover_arp(self) -> Optional[str]:
         """Active ARP scan via `sudo -n nmap`.
 
@@ -2832,7 +2875,7 @@ class CursesUI:
         if self.review_timestamp:
             header = f"Reviewing previous scan from {self.review_timestamp}"
         else:
-            header = "Scanning..."
+            header = self.discovery.scan_header_text()
         stdscr.addstr(0, 0, header)
         stdscr.attroff(curses.color_pair(2) | curses.A_BOLD)
         stdscr.refresh()
@@ -3871,6 +3914,7 @@ def main():
     if "--print" in sys.argv:
         discovery = NetworkDiscovery()
         current_subnet = discovery._get_local_subnet()
+        print(discovery.scan_header_text())
         ensure_manuf()
         check_and_authorize_sudo(discovery)
         def _print_progress(msg, key=None, final=False):
