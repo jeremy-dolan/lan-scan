@@ -790,7 +790,7 @@ def _run_summary(n_devices: int, subnet: Optional[str], timestamp: Optional[str]
 
 
 def save_run(devices, subnet: Optional[str], missing: Optional[list] = None,
-             device_name: Optional[str] = None) -> None:
+             device_name: Optional[str] = None, gateway_mac: Optional[str] = None) -> None:
     """Persist this run's results so the next invocation can diff against it
     and review mode can rehydrate the exact display."""
     if not subnet:
@@ -799,6 +799,7 @@ def save_run(devices, subnet: Optional[str], missing: Optional[list] = None,
     data = {
         "subnet": subnet,
         "device_name": device_name,
+        "gateway_mac": gateway_mac,
         "timestamp": timestamp,
         "devices": [_device_to_dict(d) for d in devices],
         "missing_devices": missing or [],
@@ -822,16 +823,25 @@ def load_previous_run() -> Optional[dict]:
     return load_run(runs[0])
 
 
-def load_previous_run_on(subnet: Optional[str]) -> Optional[dict]:
-    """The most recent run on `subnet` — the diff baseline for a new scan.
-    Keyed on subnet (not just "the last run") so alternating between networks
-    still diffs each against its own previous scan."""
+def load_diff_baseline(subnet: Optional[str], gateway_mac: Optional[str]) -> Optional[dict]:
+    """The most recent saved run of the same network -- the diff baseline for
+    a new scan. A network is identified by its subnet plus, when both runs
+    know it, the gateway's MAC: two different LANs that both use e.g.
+    192.168.1.0/24 (home vs. a café) have different routers, so they don't
+    get diffed against each other. Runs saved without a gateway MAC (older
+    runs, or a network with no gateway) match on subnet alone. Keyed on the
+    network rather than "the last run" so alternating between networks still
+    diffs each against its own previous scan."""
     if not subnet:
         return None
     for path in _history_paths():
         data = load_run(path)
-        if data and data.get("subnet") == subnet:
-            return data
+        if not data or data.get("subnet") != subnet:
+            continue
+        saved_mac = data.get("gateway_mac")
+        if gateway_mac and saved_mac and saved_mac != gateway_mac:
+            continue
+        return data
     return None
 
 
@@ -1093,6 +1103,9 @@ class NetworkDiscovery:
         self.subnet: Optional[str] = None
         # The interface scanned from (e.g. 'en0'), set alongside self.subnet.
         self.device_name: Optional[str] = None
+        # The gateway router's MAC, set after a live scan's ARP table read;
+        # identifies the network for diffing (see load_diff_baseline).
+        self.gateway_mac: Optional[str] = None
 
     def load_from(self, previous: dict) -> None:
         """Hydrate self.devices from a saved last-run.json dict (review mode)."""
@@ -1106,6 +1119,7 @@ class NetworkDiscovery:
         self.previous_timestamp = previous.get("timestamp")
         self.subnet = previous.get("subnet")
         self.device_name = previous.get("device_name")
+        self.gateway_mac = previous.get("gateway_mac")
 
     def apply_diff(self, previous: dict) -> None:
         """Mark devices not in the previous run as new; record any devices
@@ -2369,6 +2383,43 @@ class NetworkDiscovery:
                 device.mac_address = self.arp_table[device.address]
                 device.oui_registrant = lookup_oui_registrant(device.mac_address)
 
+    def _get_gateway_ip(self) -> Optional[str]:
+        """The default gateway reached through the scan interface, or None if
+        it has none (e.g. a VM host bridge, where we *are* the gateway). Only
+        a gateway inside the scanned subnet counts. Pure route-table lookup."""
+        iface = self._get_local_interface()
+        gateway = None
+        # Linux: `ip route show default dev eth0` -> "default via 192.168.1.1 ..."
+        ip_path = shutil.which("ip")
+        if ip_path and sys.platform.startswith("linux"):
+            try:
+                cmd = [ip_path, "route", "show", "default"] + (["dev", iface] if iface else [])
+                out = subprocess.run(cmd, capture_output=True, text=True, timeout=2.0).stdout
+                m = re.search(r"\bvia\s+(\S+)", out)
+                if m:
+                    gateway = m.group(1)
+            except Exception:
+                pass
+        # macOS/BSD: `route -n get -ifscope en0 default` -> "gateway: 192.168.1.1"
+        route_path = shutil.which("route")
+        if gateway is None and route_path and not sys.platform.startswith("linux"):
+            try:
+                cmd = [route_path, "-n", "get"] + (["-ifscope", iface] if iface else []) + ["default"]
+                out = subprocess.run(cmd, capture_output=True, text=True, timeout=2.0).stdout
+                m = re.search(r"gateway:\s*(\S+)", out)
+                if m:
+                    gateway = m.group(1)
+            except Exception:
+                pass
+        if not gateway or not self.subnet:
+            return None
+        try:
+            if ipaddress.IPv4Address(gateway) in ipaddress.ip_network(self.subnet):
+                return gateway
+        except ValueError:
+            pass
+        return None
+
     def _get_local_ip(self) -> Optional[str]:
         """The chosen interface's IP; without one, the default route's, found
         by opening a UDP socket to a public address.
@@ -2658,6 +2709,10 @@ class NetworkDiscovery:
         # Catch devices found via mDNS/SSDP that the arp sweep missed
         # fill in vendors for MAC addresses before vendor-specific probes
         self.populate_mac_addresses()
+        # The ARP table is freshest right after the sweep, so read the
+        # gateway's MAC from it now.
+        gateway_ip = self._get_gateway_ip()
+        self.gateway_mac = self.arp_table.get(gateway_ip) if gateway_ip else None
 
         start = time.monotonic()
         await self.enrich_roku()
@@ -3166,10 +3221,12 @@ class CursesUI:
             asyncio.run(self.discovery.discover(timeout=3.0, on_progress=progress))
             self.scan_timestamp = datetime.now().isoformat(timespec="seconds")
 
-        # Diff against previous run, if available (skipped in review mode —
-        # there's no "previous" relative to a static cached snapshot).
+        # Diff against the previous run of this network, if any (skipped in
+        # review mode — there's no "previous" relative to a static cached
+        # snapshot). Chosen after the scan, since identifying the network
+        # needs the gateway MAC the scan just read.
         if not self.review_timestamp:
-            previous = getattr(self.discovery, "_pending_diff", None)
+            previous = load_diff_baseline(self.discovery.subnet, self.discovery.gateway_mac)
             if previous is not None:
                 self.discovery.apply_diff(previous)
 
@@ -4205,12 +4262,6 @@ def _run_new_scan_tui() -> None:
     discovery = NetworkDiscovery(choice)
     current_subnet = discovery._get_local_subnet()
     ensure_manuf()
-
-    # Diff against the last run on this same subnet
-    previous = load_previous_run_on(current_subnet)
-    if previous:
-        discovery._pending_diff = previous
-
     check_and_authorize_sudo(discovery)
 
     ui = CursesUI(discovery)
@@ -4221,7 +4272,7 @@ def _run_new_scan_tui() -> None:
         # on disk so --load-previous still recalls the prior good snapshot.
         sys.exit(130)
     save_run(discovery.devices.values(), current_subnet, discovery.missing_devices,
-             discovery.device_name)
+             discovery.device_name, discovery.gateway_mac)
 
 
 def _load_previous_tui(previous: Optional[dict]) -> None:
@@ -4294,7 +4345,7 @@ def main():
             sys.exit(130)
         discovery.print_results()
         save_run(discovery.devices.values(), current_subnet, discovery.missing_devices,
-                 discovery.device_name)
+                 discovery.device_name, discovery.gateway_mac)
         return
 
     if "--load-previous" in sys.argv:
@@ -4348,11 +4399,6 @@ def main():
             break
         discovery = NetworkDiscovery(network)
         current_subnet = discovery._get_local_subnet()
-        # Diff against the last run on this same subnet
-        entry = next((e for e in history if e["subnet"] == current_subnet), None)
-        previous = load_run(entry["path"]) if entry else None
-        if previous:
-            discovery._pending_diff = previous
         if _arp_requires_sudo_passwd_auth(discovery):
             # Need to ask the user for a password — must happen in cooked
             # terminal mode, so bail out of curses and let the caller run
@@ -4380,7 +4426,7 @@ def main():
             sys.exit(130)
 
     save_run(discovery.devices.values(), current_subnet, discovery.missing_devices,
-             discovery.device_name)
+             discovery.device_name, discovery.gateway_mac)
 
 
 if __name__ == "__main__":

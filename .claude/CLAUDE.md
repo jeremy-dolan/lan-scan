@@ -80,8 +80,8 @@ change needed.
 ### Cache / persistence
 Everything lives under `~/.cache/lan-scan/`: the `manuf` OUI database and `history/*.json`
 (one file per run, ISO-8601 timestamp filename, pruned to `HISTORY_MAX=50`; each records its
-`subnet` and `device_name`). Each scan is saved so the next scan on the same subnet can diff
-against it and review mode can rehydrate the exact display.
+`subnet`, `device_name` and `gateway_mac`). Each scan is saved so the next scan of the same
+network can diff against it and review mode can rehydrate the exact display.
 
 ## Architecture
 
@@ -133,7 +133,9 @@ in the same struct-based style as the mDNS and NetBIOS packet builders.
 
 Diffing: `apply_diff()` marks devices absent from the previous run as `is_new` and records
 `missing_devices` (present last time, gone now). `load_from()` rehydrates a saved run for
-review mode. A diff only runs when the saved run's subnet matches the current subnet.
+review mode. The baseline is picked after the scan by `load_diff_baseline()`: the newest saved
+run of the same network, i.e. same subnet and — when both runs recorded one — same gateway MAC,
+so two LANs that share e.g. 192.168.1.0/24 aren't diffed against each other.
 
 ### `CursesUI` — the presenter
 `run(stdscr)` drives discovery (or loads a cached run in review mode), then a modal event
