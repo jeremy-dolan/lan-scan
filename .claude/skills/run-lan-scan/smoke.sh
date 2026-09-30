@@ -84,7 +84,7 @@ echo "  TUI exited cleanly (returned to shell)"
 
 echo "== 5. non-TUI sanity: --print-previous =="
 "$BIN" --print-previous > "$OUT/print-previous.txt" 2>&1
-grep -q "device(s)" "$OUT/print-previous.txt" || { echo "FAIL: --print-previous produced no device table" >&2; exit 1; }
+grep -qE "Found [0-9]+ devices?" "$OUT/print-previous.txt" || { echo "FAIL: --print-previous produced no device table" >&2; exit 1; }
 echo "  --print-previous ok"
 
 echo

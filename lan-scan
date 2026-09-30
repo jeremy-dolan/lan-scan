@@ -2753,17 +2753,34 @@ class NetworkDiscovery:
         resolved = sum(1 for d in self.devices.values() if d.rdns_name)
         report(f"  Reverse DNS            {resolved:>3} resolved  ({time.monotonic() - start:.1f}s)")
 
-    def print_results(self):
-        """Print discovered devices in a formatted table."""
-        print("\n" + "=" * 90)
-        print(f"{'ADDRESS':15} | {'DEVICE':40} | SERVICES")
-        print("-" * 90)
+    def print_results(self, baseline_timestamp: Optional[str] = None):
+        """Print discovered devices in a formatted table. Devices new since
+        the previous run are marked '+', and ones missing since then follow,
+        marked '-' (what the TUI shows in green / dim). baseline_timestamp is
+        the run a live scan was just diffed against, for the summary line."""
+        def by_address(addr: str):
+            return tuple(map(int, addr.split(".")))
 
-        for device in sorted(self.devices.values(), key=lambda d: tuple(map(int, d.address.split(".")))):
-            print(device)
+        print("\n" + "=" * 92)
+        print(f"  {'ADDRESS':15} | {'DEVICE':40} | SERVICES")
+        print("-" * 92)
 
-        print("=" * 90)
-        print(f"Found {len(self.devices)} device(s)\n")
+        for device in sorted(self.devices.values(), key=lambda d: by_address(d.address)):
+            print(f"{'+' if device.is_new else ' '} {device}")
+        for m in sorted(self.missing_devices, key=lambda m: by_address(m["address"])):
+            print(f"- {_device_from_dict(m)}")
+
+        print("=" * 92)
+        n = len(self.devices)
+        summary = f"Found {n} {plural(n, 'device')}"
+        n_new = sum(1 for d in self.devices.values() if d.is_new)
+        n_missing = len(self.missing_devices)
+        if baseline_timestamp:
+            summary += (f": {n_new} new, {n_missing} missing since the scan at "
+                        f"{_friendly_time(baseline_timestamp)}")
+        elif n_new or n_missing:
+            summary += f" ({n_new} new, {n_missing} missing)"
+        print(summary + "\n")
 
 
 # Folder icon used to mark <device> nodes in the UPnP tree. The renderer
@@ -4400,7 +4417,11 @@ def main():
             asyncio.run(discovery.discover(timeout=3.0, on_progress=_print_progress))
         except KeyboardInterrupt:
             sys.exit(130)
-        discovery.print_results()
+        # Diff against the previous run of this network, as the TUI does.
+        previous = load_diff_baseline(discovery.subnet, discovery.gateway_mac)
+        if previous is not None:
+            discovery.apply_diff(previous)
+        discovery.print_results(previous.get("timestamp") if previous else None)
         save_run(discovery.devices.values(), current_subnet, discovery.missing_devices,
                  discovery.device_name, discovery.gateway_mac)
         return
