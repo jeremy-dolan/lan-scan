@@ -1125,7 +1125,7 @@ class NetworkDiscovery:
         self.gateway_mac: Optional[str] = None
 
     def load_from(self, previous: dict) -> None:
-        """Hydrate self.devices from a saved last-run.json dict (review mode)."""
+        """Hydrate self.devices from a saved run dict (review mode)."""
         for d in previous.get("devices", []):
             try:
                 device = _device_from_dict(d)

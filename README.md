@@ -20,21 +20,33 @@ for highlighting differences between runs.
 ```bash
 lan-scan                # interactively scan or review previous scans
 lan-scan --print        # scan and print results to stdout (non-interactive)
+lan-scan --print -d en0 # scan the network on interface en0
 lan-scan --help         # view all options
 ```
 
-In the TUI: `↑` `↓` or `j` `k` to select, `ENTER` for device details, `?` for
-help, `q` to quit. Devices new since the last saved run are highlighted in
-green; devices missing since the last run are listed dimmed at the bottom.
+If the machine is on more than one network (e.g. Wi-Fi plus a VM bridge),
+a new scan asks which one to scan; `-d DEV` picks it up front. Interfaces on
+the same LAN (e.g. Ethernet and Wi-Fi to the same router) are not individually
+selectable as `lan-scan` uses the OS's prefered route. (TODO: Remove the
+grouping, pin every socket with IP_BOUND_IF/SO_BINDTODEVICE, filter the ARP
+table to the chosen interface, use nmap's `-e` and change the sudoers recipe.)
 
-Scans (and MAC OUI database) are cached under `~/.cache/lan-scan/`.
+In the TUI: `↑` `↓` or `j` `k` to select, `ENTER` for device details, `?` for
+help, `q` to quit. Devices new since the last scan of the same network are
+highlighted in green; devices missing since then are listed dimmed at the
+bottom. (`--print` marks them `+` and `-`.) A "network" is defined as a subnet
+plus its router's MAC address, so LANs that share a subnet address aren't
+mistakenly diffed.
+
+Scans (and MAC OUI database) are saved in `~/.cache/lan-scan/`.
 
 ## How it works
 
 lan-scan runs several discovery protocols against the local subnet, then
 enriches each discovered host with follow-up probes. Each UDP multicast socket
-joins its group (`IP_ADD_MEMBERSHIP`) and bounded-waits for replies. Multicast
-on Wi-Fi is lossy, so each query is sent twice with a 0.3 s gap.
+joins its group (`IP_ADD_MEMBERSHIP`) on the scanned network's interface and
+bounded-waits for replies. Multicast on Wi-Fi is lossy, so each query is sent
+twice with a 0.3 s gap. (Reliability could probably be further improved.)
 
 ### Discovery
 
