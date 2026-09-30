@@ -720,7 +720,8 @@ def load_run(path: Path) -> Optional[dict]:
 
 def list_history() -> list[dict]:
     """Return history metadata newest-first for the startup menu.
-    Each entry: {'path': Path, 'timestamp': str, 'subnet': str, 'n_devices': int}."""
+    Each entry: {'path': Path, 'timestamp': str, 'subnet': str,
+    'device_name': Optional[str], 'n_devices': int}."""
     entries = []
     for path in _history_paths():
         data = load_run(path)
@@ -730,6 +731,7 @@ def list_history() -> list[dict]:
             "path": path,
             "timestamp": data.get("timestamp") or path.stem,
             "subnet": data.get("subnet") or "?",
+            "device_name": data.get("device_name"),
             "n_devices": len(data.get("devices") or []),
         })
     return entries
@@ -755,13 +757,16 @@ def _friendly_time(iso_ts: Optional[str], pad_hour: bool = False) -> str:
 
 
 def _run_summary(n_devices: int, subnet: Optional[str], timestamp: Optional[str],
-                 new: int = 0, missing: int = 0, align: bool = False) -> str:
+                 new: int = 0, missing: int = 0, align: bool = False,
+                 device_name: Optional[str] = None, device_width: int = 0) -> str:
     """One-line scan summary shared by the load-scans menu and the TUI status
-    bar, e.g. '26 devices (15 new, 11 missing) on 192.168.1.0/24 at 1:25 PM,
-    May 26'. The new/missing breakdown is only passed for a live scan. With
-    align (the menu's multi-row listing), the device count is right-aligned to
-    width 3, the subnet left-aligned to the widest CIDR, and the hour to width 2
-    so the rows line up into columns."""
+    bar, e.g. '26 devices (15 new, 11 missing) on 192.168.1.0/24 via en0 at
+    1:25 PM, May 26'. The new/missing breakdown is only passed for a live scan;
+    the 'via' part is omitted when the device name is unknown (runs saved
+    before it was recorded). With align (the menu's multi-row listing), the
+    device count is right-aligned to width 3, the subnet left-aligned to the
+    widest CIDR, the device name to device_width, and the hour to width 2 so
+    the rows line up into columns."""
     count = f"{n_devices:>3}" if align else str(n_devices)
     summary = f"{count} {plural(n_devices, 'device')}"
     breakdown = []
@@ -775,12 +780,17 @@ def _run_summary(n_devices: int, subnet: Optional[str], timestamp: Optional[str]
     if align:
         net = net.ljust(len("255.255.255.255/32"))  # widest IPv4 CIDR
     summary += f" on {net}"
+    via = f" via {device_name}" if device_name else ""
+    if align and device_width:
+        via = via.ljust(len(" via ") + device_width)
+    summary += via
     if timestamp:
         summary += f" at {_friendly_time(timestamp, pad_hour=align)}"
     return summary
 
 
-def save_run(devices, subnet: Optional[str], missing: Optional[list] = None) -> None:
+def save_run(devices, subnet: Optional[str], missing: Optional[list] = None,
+             device_name: Optional[str] = None) -> None:
     """Persist this run's results so the next invocation can diff against it
     and review mode can rehydrate the exact display."""
     if not subnet:
@@ -788,6 +798,7 @@ def save_run(devices, subnet: Optional[str], missing: Optional[list] = None) -> 
     timestamp = datetime.now().isoformat(timespec="seconds")
     data = {
         "subnet": subnet,
+        "device_name": device_name,
         "timestamp": timestamp,
         "devices": [_device_to_dict(d) for d in devices],
         "missing_devices": missing or [],
@@ -811,8 +822,267 @@ def load_previous_run() -> Optional[dict]:
     return load_run(runs[0])
 
 
+def load_previous_run_on(subnet: Optional[str]) -> Optional[dict]:
+    """The most recent run on `subnet` — the diff baseline for a new scan.
+    Keyed on subnet (not just "the last run") so alternating between networks
+    still diffs each against its own previous scan."""
+    if not subnet:
+        return None
+    for path in _history_paths():
+        data = load_run(path)
+        if data and data.get("subnet") == subnet:
+            return data
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Local interface discovery / selection
+# ---------------------------------------------------------------------------
+
+# A scan needs an IPv4 interface that's up and can broadcast + multicast;
+# loopback and point-to-point links (VPN utun*, gif*, ...) can't carry the
+# multicast discovery or the ARP sweep, so they're never offered.
+_REQUIRED_IF_FLAGS = {"UP", "BROADCAST", "MULTICAST"}
+_EXCLUDED_IF_FLAGS = {"LOOPBACK", "POINTOPOINT"}
+
+
+@dataclass
+class NetInterface:
+    """One scannable local interface."""
+    name: str                       # OS device name, e.g. 'en0'
+    ip: str
+    prefixlen: int
+    label: Optional[str] = None     # e.g. 'Wi-Fi', 'Thunderbolt Ethernet Slot 0'
+    is_virtual: bool = False        # no backing hardware (VM bridge, docker0, ...)
+    is_default_route: bool = False
+
+    @property
+    def subnet(self) -> str:
+        return str(ipaddress.ip_network(f"{self.ip}/{self.prefixlen}", strict=False))
+
+
+@dataclass
+class NetChoice:
+    """A network the user can pick to scan: usually one interface, but several
+    when more than one sits on the same subnet (e.g. Ethernet and Wi-Fi on the
+    same LAN). We can't choose between those — traffic to the LAN follows the
+    routing table — so `interface` is the one the OS routes the subnet through
+    (and the one the scan uses), and the rest are listed in `others` so the
+    picker can say so."""
+    interface: NetInterface
+    others: list[NetInterface] = field(default_factory=list)
+
+    @property
+    def is_default_route(self) -> bool:
+        return any(i.is_default_route for i in [self.interface, *self.others])
+
+
+def _netmask_to_prefixlen(netmask: str) -> Optional[int]:
+    """Convert a netmask to a prefix length. Accepts both the hex form
+    BSD/macOS `ifconfig` prints (e.g. '0xffffff00') and dotted-quad
+    (e.g. '255.255.255.0'). Returns None if it can't be parsed."""
+    try:
+        if netmask.lower().startswith("0x"):
+            value = int(netmask, 16)
+        else:
+            value = int(ipaddress.IPv4Address(netmask))
+    except (ValueError, ipaddress.AddressValueError):
+        return None
+    prefix = bin(value).count("1")
+    # Reject non-contiguous masks (count of set bits wouldn't be meaningful).
+    if value != (((1 << prefix) - 1) << (32 - prefix)):
+        return None
+    return prefix
+
+
+def _route_interface(dest: str) -> Optional[str]:
+    """Name of the interface the OS routes `dest` through. No packets are
+    sent -- these are pure route-table lookups. Returns None if it can't be
+    determined."""
+    # Linux: `ip route get 8.8.8.8` -> "8.8.8.8 via 192.168.1.1 dev eth0 src ..."
+    ip_path = shutil.which("ip")
+    if ip_path:
+        try:
+            out = subprocess.run(
+                [ip_path, "route", "get", dest],
+                capture_output=True, text=True, timeout=2.0,
+            ).stdout
+            m = re.search(r"\bdev\s+(\S+)", out)
+            if m:
+                return m.group(1)
+        except Exception:
+            pass
+    # macOS/BSD: `route -n get 8.8.8.8` -> "... interface: en0 ..."
+    route_path = shutil.which("route")
+    if route_path:
+        try:
+            out = subprocess.run(
+                [route_path, "-n", "get", dest],
+                capture_output=True, text=True, timeout=2.0,
+            ).stdout
+            m = re.search(r"interface:\s*(\S+)", out)
+            if m:
+                return m.group(1)
+        except Exception:
+            pass
+    return None
+
+
+def _is_scannable_ipv4(ip: str) -> bool:
+    """A real LAN address: not loopback, not 169.254 link-local (a DHCP
+    failure address -- nothing useful to scan)."""
+    try:
+        addr = ipaddress.IPv4Address(ip)
+    except ValueError:
+        return False
+    return not (addr.is_loopback or addr.is_link_local or addr.is_unspecified)
+
+
+def _hardware_port_labels() -> dict[str, str]:
+    """macOS: device name -> hardware port name ('en0' -> 'Wi-Fi') from
+    `networksetup -listallhardwareports`. Empty elsewhere or on failure."""
+    path = shutil.which("networksetup")
+    if not path:
+        return {}
+    try:
+        out = subprocess.run(
+            [path, "-listallhardwareports"],
+            capture_output=True, text=True, timeout=2.0,
+        ).stdout
+    except Exception:
+        return {}
+    return {
+        dev: port.strip()
+        for port, dev in re.findall(r"Hardware Port:\s*(.+)\nDevice:\s*(\S+)", out)
+    }
+
+
+def _list_interfaces_ifconfig() -> list[NetInterface]:
+    """macOS/BSD: scannable interfaces from `ifconfig`. Hardware-port labels
+    come from networksetup; an interface without one (bridge100, vmenet0, ...)
+    is virtual."""
+    ifconfig_path = shutil.which("ifconfig")
+    if not ifconfig_path:
+        return []
+    try:
+        out = subprocess.run(
+            [ifconfig_path], capture_output=True, text=True, timeout=2.0,
+        ).stdout
+    except Exception:
+        return []
+    labels = _hardware_port_labels()
+    result = []
+    # One block per interface: a flush-left header line, then indented detail.
+    for block in re.split(r"\n(?=\S)", out):
+        m = re.match(r"(\S+?):\s+flags=\w+<([^>]*)>", block)
+        if not m:
+            continue
+        name, flags = m.group(1), set(m.group(2).split(","))
+        if not (_REQUIRED_IF_FLAGS | {"RUNNING"}) <= flags or flags & _EXCLUDED_IF_FLAGS:
+            continue
+        # "status: inactive" = no link (unplugged Ethernet, Wi-Fi off).
+        status = re.search(r"^\s+status:\s*(\S+)", block, re.M)
+        if status and status.group(1) != "active":
+            continue
+        for ip, mask in re.findall(r"^\s+inet\s+(\S+)\s+netmask\s+(\S+)", block, re.M):
+            prefix = _netmask_to_prefixlen(mask)
+            if prefix is None or not _is_scannable_ipv4(ip):
+                continue
+            result.append(NetInterface(
+                name, ip, prefix,
+                label=labels.get(name),
+                # Without networksetup we can't tell, so don't call it virtual.
+                is_virtual=bool(labels) and name not in labels,
+            ))
+            break  # first usable address per interface
+    return result
+
+
+def _list_interfaces_ip() -> list[NetInterface]:
+    """Linux: scannable interfaces from `ip -j -4 addr show`. Labels come
+    from sysfs: a wireless/ dir means Wi-Fi, a device/ link means real
+    hardware, neither means virtual (docker0, virbr0, br-*, ...)."""
+    ip_path = shutil.which("ip")
+    if not ip_path:
+        return []
+    try:
+        entries = json.loads(subprocess.run(
+            [ip_path, "-j", "-4", "addr", "show"],
+            capture_output=True, text=True, timeout=2.0,
+        ).stdout)
+    except Exception:
+        return []
+    result = []
+    for entry in entries:
+        name = entry.get("ifname")
+        flags = set(entry.get("flags") or [])
+        # LOWER_UP is Linux's "has carrier" (ifconfig's RUNNING/status: active).
+        if not name or not (_REQUIRED_IF_FLAGS | {"LOWER_UP"}) <= flags \
+                or flags & _EXCLUDED_IF_FLAGS:
+            continue
+        for addr in entry.get("addr_info") or []:
+            ip = addr.get("local", "")
+            if addr.get("family") != "inet" or not _is_scannable_ipv4(ip):
+                continue
+            sysfs = Path("/sys/class/net") / name
+            if (sysfs / "wireless").exists():
+                label, virtual = "Wi-Fi", False
+            elif (sysfs / "device").exists():
+                label, virtual = "Ethernet", False
+            else:
+                label, virtual = None, True
+            result.append(NetInterface(name, ip, int(addr.get("prefixlen", 24)),
+                                       label=label, is_virtual=virtual))
+            break  # first usable address per interface
+    return result
+
+
+def list_network_choices() -> list[NetChoice]:
+    """The networks this host can scan, best first: the one holding the
+    default route, then hardware interfaces, then virtual ones. Interfaces
+    sharing a subnet are folded into a single choice (see NetChoice). Empty
+    if the interface table can't be read -- callers then fall back to the
+    default-route heuristics in NetworkDiscovery."""
+    if sys.platform.startswith("linux"):
+        interfaces = _list_interfaces_ip()
+    else:
+        interfaces = _list_interfaces_ifconfig()
+    default_if = _route_interface("8.8.8.8")
+    for iface in interfaces:
+        iface.is_default_route = iface.name == default_if
+
+    by_subnet: dict[str, list[NetInterface]] = {}
+    for iface in interfaces:
+        by_subnet.setdefault(iface.subnet, []).append(iface)
+
+    choices = []
+    for subnet, group in by_subnet.items():
+        primary = group[0]
+        if len(group) > 1:
+            # Ask the routing table which interface actually carries traffic
+            # to this LAN, using any host address that isn't one of ours
+            # (routing our own address would just answer lo0).
+            ours = {i.ip for i in group}
+            net = ipaddress.ip_network(subnet)
+            probe = next((str(h) for h in net.hosts() if str(h) not in ours), None)
+            routed = _route_interface(probe) if probe else None
+            primary = next(
+                (i for i in group if i.name == routed),
+                next((i for i in group if i.is_default_route), group[0]),
+            )
+        choices.append(NetChoice(primary, [i for i in group if i is not primary]))
+
+    # Stable sort, so ties keep the OS's interface order.
+    choices.sort(key=lambda c: (not c.is_default_route, c.interface.is_virtual))
+    return choices
+
+
 class NetworkDiscovery:
-    def __init__(self):
+    def __init__(self, choice: Optional[NetChoice] = None):
+        # The network to scan (see list_network_choices). None falls back to
+        # whatever the default route points at.
+        self.choice = choice
+        self.interface: Optional[NetInterface] = choice.interface if choice else None
         self.devices: dict[str, Device] = {}
         self.arp_table: dict[str, str] = {}
         # Populated by apply_diff(); list of dicts in the same shape as _device_to_dict
@@ -821,6 +1091,8 @@ class NetworkDiscovery:
         # The scanned subnet, for the TUI status bar. Set during discover_arp on
         # a live scan, or from the saved run in review mode (load_from).
         self.subnet: Optional[str] = None
+        # The interface scanned from (e.g. 'en0'), set alongside self.subnet.
+        self.device_name: Optional[str] = None
 
     def load_from(self, previous: dict) -> None:
         """Hydrate self.devices from a saved last-run.json dict (review mode)."""
@@ -833,6 +1105,7 @@ class NetworkDiscovery:
         self.missing_devices = previous.get("missing_devices", []) or []
         self.previous_timestamp = previous.get("timestamp")
         self.subnet = previous.get("subnet")
+        self.device_name = previous.get("device_name")
 
     def apply_diff(self, previous: dict) -> None:
         """Mark devices not in the previous run as new; record any devices
@@ -873,6 +1146,22 @@ class NetworkDiscovery:
         if source:
             device.provenance.add(source)
         return device
+
+    def _pin_multicast(self, sock: socket.socket) -> bytes:
+        """Send this socket's multicast out of the scan interface rather than
+        the kernel's default multicast interface, which needn't match the one
+        the ARP sweep and subnet detection use. Returns the packed interface
+        address for IP_ADD_MEMBERSHIP (INADDR_ANY if unknown -- the kernel
+        then picks, as before)."""
+        ip = self._get_local_ip()
+        if ip:
+            try:
+                packed = socket.inet_aton(ip)
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, packed)
+                return packed
+            except OSError:
+                pass
+        return socket.inet_aton("0.0.0.0")
 
     async def discover_mdns(self, timeout: float = 3.0):
         """Discover devices via mDNS (multicast DNS).
@@ -918,8 +1207,9 @@ class NetworkDiscovery:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
         sock.bind(("", MDNS_PORT))
 
-        # Join multicast group
-        mreq = struct.pack("4sl", socket.inet_aton(MDNS_ADDR), socket.INADDR_ANY)
+        # Join the multicast group on the scan interface
+        iface = self._pin_multicast(sock)
+        mreq = struct.pack("4s4s", socket.inet_aton(MDNS_ADDR), iface)
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
         sock.setblocking(False)
 
@@ -1183,6 +1473,7 @@ class NetworkDiscovery:
 
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._pin_multicast(sock)
         sock.setblocking(False)
 
         # Send each M-SEARCH twice with a small gap — multicast on home Wi-Fi
@@ -1232,6 +1523,7 @@ class NetworkDiscovery:
 
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._pin_multicast(sock)
         sock.setblocking(False)
 
         import uuid
@@ -2078,11 +2370,14 @@ class NetworkDiscovery:
                 device.oui_registrant = lookup_oui_registrant(device.mac_address)
 
     def _get_local_ip(self) -> Optional[str]:
-        """Determine the local IP by opening a UDP socket to a public address.
+        """The chosen interface's IP; without one, the default route's, found
+        by opening a UDP socket to a public address.
 
         No packets are actually sent — connect() on a UDP socket just selects
         the route, which lets us read back the outbound interface address.
         """
+        if self.interface:
+            return self.interface.ip
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.connect(("8.8.8.8", 80))
@@ -2109,7 +2404,10 @@ class NetworkDiscovery:
         local_ip = self._get_local_ip()
         if not local_ip:
             return None
-        prefix = self._get_local_prefixlen(local_ip)
+        if self.interface:
+            prefix = self.interface.prefixlen
+        else:
+            prefix = self._get_local_prefixlen(local_ip)
         if prefix is None:
             prefix = 24
         real = ipaddress.ip_network(f"{local_ip}/{prefix}", strict=False)
@@ -2157,28 +2455,10 @@ class NetworkDiscovery:
                     rf"inet {re.escape(local_ip)}\s+netmask\s+(\S+)", out
                 )
                 if m:
-                    return self._netmask_to_prefixlen(m.group(1))
+                    return _netmask_to_prefixlen(m.group(1))
             except Exception:
                 pass
         return None
-
-    @staticmethod
-    def _netmask_to_prefixlen(netmask: str) -> Optional[int]:
-        """Convert a netmask to a prefix length. Accepts both the hex form
-        BSD/macOS `ifconfig` prints (e.g. '0xffffff00') and dotted-quad
-        (e.g. '255.255.255.0'). Returns None if it can't be parsed."""
-        try:
-            if netmask.lower().startswith("0x"):
-                value = int(netmask, 16)
-            else:
-                value = int(ipaddress.IPv4Address(netmask))
-        except (ValueError, ipaddress.AddressValueError):
-            return None
-        prefix = bin(value).count("1")
-        # Reject non-contiguous masks (count of set bits wouldn't be meaningful).
-        if value != (((1 << prefix) - 1) << (32 - prefix)):
-            return None
-        return prefix
 
     def scan_header_text(self) -> str:
         """'Scanning...' annotated with the local interface/IP, when available."""
@@ -2191,37 +2471,12 @@ class NetworkDiscovery:
         return "Scanning..."
 
     def _get_local_interface(self) -> Optional[str]:
-        """Name of the interface used for the default outbound route (the
-        same route _get_local_ip() resolves), for display purposes. No
-        packets are sent -- these are pure route-table lookups. Returns None
-        if it can't be determined."""
-        # Linux: `ip route get 8.8.8.8` -> "8.8.8.8 via 192.168.1.1 dev eth0 src ..."
-        ip_path = shutil.which("ip")
-        if ip_path:
-            try:
-                out = subprocess.run(
-                    [ip_path, "route", "get", "8.8.8.8"],
-                    capture_output=True, text=True, timeout=2.0,
-                ).stdout
-                m = re.search(r"\bdev\s+(\S+)", out)
-                if m:
-                    return m.group(1)
-            except Exception:
-                pass
-        # macOS/BSD: `route get 8.8.8.8` -> "... interface: en0 ..."
-        route_path = shutil.which("route")
-        if route_path:
-            try:
-                out = subprocess.run(
-                    [route_path, "get", "8.8.8.8"],
-                    capture_output=True, text=True, timeout=2.0,
-                ).stdout
-                m = re.search(r"interface:\s*(\S+)", out)
-                if m:
-                    return m.group(1)
-            except Exception:
-                pass
-        return None
+        """Name of the interface scanned from: the chosen one, else the one
+        holding the default route (the same route _get_local_ip() resolves).
+        Returns None if it can't be determined."""
+        if self.interface:
+            return self.interface.name
+        return _route_interface("8.8.8.8")
 
     async def discover_arp(self) -> Optional[str]:
         """Active ARP scan via `sudo -n nmap`.
@@ -2236,6 +2491,7 @@ class NetworkDiscovery:
         # self.subnet is the real subnet (TUI status bar / diff); nmap targets
         # the possibly-capped sweep window — see _detect_subnet.
         self.subnet, sweep = detected
+        self.device_name = self._get_local_interface()
 
         nmap_path = shutil.which("nmap")
         if not nmap_path:
@@ -3140,6 +3396,7 @@ class CursesUI:
                 len(self.devices), self.discovery.subnet,
                 self.review_timestamp or self.scan_timestamp,
                 new=new_count, missing=len(missing),
+                device_name=self.discovery.device_name,
             )
             stdscr.attron(curses.color_pair(2))
             stdscr.addnstr(height - 2, 0, summary.center(width - 1), width - 1)
@@ -3734,8 +3991,11 @@ def _startup_menu(stdscr, history: list[dict]) -> Optional[tuple[str, Optional[d
     items: list[tuple[str, str, Optional[dict]]] = [("new", "New scan", None)]
     if history:
         items.append(("separator", "", None))
+        device_width = max(len(e.get("device_name") or "") for e in history)
         for entry in history:
-            label = _run_summary(entry["n_devices"], entry["subnet"], entry["timestamp"], align=True)
+            label = _run_summary(entry["n_devices"], entry["subnet"], entry["timestamp"],
+                                 align=True, device_name=entry.get("device_name"),
+                                 device_width=device_width)
             items.append(("history", label, entry))
 
     selectable = [i for i, item in enumerate(items) if item[0] != "separator"]
@@ -3815,6 +4075,99 @@ def _startup_menu(stdscr, history: list[dict]) -> Optional[tuple[str, Optional[d
             stdscr.clear()
 
 
+def _network_menu(stdscr, choices: list[NetChoice], cancel_hint: str) -> Optional[NetChoice]:
+    """Curses picker for which network to scan. One selectable block per
+    NetChoice: a row per interface (device, address/prefix, label), plus a
+    note when several interfaces share the LAN, since we can't pick between
+    those -- the OS routes the traffic. Returns the choice, or None if the
+    user backed out (q/ESC)."""
+    curses.set_escdelay(50)
+    curses.curs_set(0)
+    curses.use_default_colors()
+    curses.init_pair(1, curses.COLOR_BLACK, curses.COLOR_WHITE)  # Selected
+    curses.init_pair(2, curses.COLOR_CYAN, -1)                   # Header / footer
+
+    everyone = [i for c in choices for i in [c.interface, *c.others]]
+    name_w = max(len(i.name) for i in everyone)
+    addr_w = max(len(f"{i.ip}/{i.prefixlen}") for i in everyone)
+
+    def describe(iface: NetInterface) -> str:
+        label = iface.label or ("virtual" if iface.is_virtual else "")
+        if iface.is_default_route:
+            label = f"{label} (default route)" if label else "(default route)"
+        return f"  {iface.name:<{name_w}}  {f'{iface.ip}/{iface.prefixlen}':<{addr_w}}  {label}"
+
+    # lines: (choice index, text, is_note)
+    lines: list[tuple[int, str, bool]] = []
+    for ci, choice in enumerate(choices):
+        for iface in [choice.interface, *choice.others]:
+            lines.append((ci, describe(iface), False))
+        if choice.others:
+            names = [choice.interface.name, *(o.name for o in choice.others)]
+            both = "both" if len(names) == 2 else "all"
+            lines.append((ci, f"  {'':<{name_w}}  Same LAN on {both} — can't choose between "
+                              f"them; the OS sends traffic via {choice.interface.name}", True))
+
+    cur = 0
+    top = 0
+    while True:
+        stdscr.erase()
+        height, width = stdscr.getmaxyx()
+
+        # Body occupies rows 2 .. height-2 (row 0 header, height-1 footer).
+        # Scroll so the whole selected block is visible.
+        n_visible = max(1, height - 3)
+        block = [n for n, (ci, _, _) in enumerate(lines) if ci == cur]
+        if block[0] < top:
+            top = block[0]
+        elif block[-1] >= top + n_visible:
+            top = max(block[-1] - n_visible + 1, 0)
+
+        stdscr.attron(curses.color_pair(2) | curses.A_BOLD)
+        stdscr.addnstr(0, 0, "Choose a network to scan", width - 1)
+        stdscr.attroff(curses.color_pair(2) | curses.A_BOLD)
+
+        for n, (ci, text, is_note) in enumerate(lines):
+            if n < top or n >= top + n_visible:
+                continue
+            row = (n - top) + 2
+            try:
+                if ci == cur:
+                    stdscr.addnstr(row, 0, text.ljust(width - 1), width - 1, curses.color_pair(1))
+                else:
+                    stdscr.addnstr(row, 0, text, width - 1, curses.A_DIM if is_note else 0)
+            except curses.error:
+                pass
+
+        footer = f" UP/DOWN: navigate │ ENTER: scan │ {cancel_hint} "
+        try:
+            stdscr.attron(curses.color_pair(2))
+            stdscr.addnstr(height - 1, 0, footer.center(width - 1), width - 1)
+            stdscr.attroff(curses.color_pair(2))
+        except curses.error:
+            pass
+
+        stdscr.refresh()
+
+        try:
+            key = stdscr.getch()
+        except KeyboardInterrupt:
+            return None
+
+        if key in (ord('q'), 27, 3):  # q, ESC, Ctrl-C (raw mode safety)
+            return None
+        elif key in (curses.KEY_UP, ord('k')):
+            cur = max(0, cur - 1)
+        elif key in (curses.KEY_DOWN, ord('j')):
+            cur = min(len(choices) - 1, cur + 1)
+        elif key in (curses.KEY_HOME, curses.KEY_PPAGE):
+            cur = 0
+        elif key in (curses.KEY_END, curses.KEY_NPAGE):
+            cur = len(choices) - 1
+        elif key in (10, 13, curses.KEY_ENTER):
+            return choices[cur]
+
+
 USAGE = """\
 Usage: lan-scan [OPTIONS]
 
@@ -3839,13 +4192,23 @@ the curses TUI.
 """
 
 
-def _run_new_scan_tui(previous: Optional[dict]) -> None:
-    discovery = NetworkDiscovery()
+def _run_new_scan_tui() -> None:
+    choices = list_network_choices()
+    choice = choices[0] if choices else None
+    if len(choices) > 1:
+        try:
+            choice = curses.wrapper(_network_menu, choices, "q/ESC: quit")
+        except KeyboardInterrupt:
+            sys.exit(130)
+        if choice is None:
+            return
+    discovery = NetworkDiscovery(choice)
     current_subnet = discovery._get_local_subnet()
     ensure_manuf()
 
-    # Diff against the previous run only if the subnet matches
-    if previous and previous.get("subnet") == current_subnet:
+    # Diff against the last run on this same subnet
+    previous = load_previous_run_on(current_subnet)
+    if previous:
         discovery._pending_diff = previous
 
     check_and_authorize_sudo(discovery)
@@ -3857,7 +4220,8 @@ def _run_new_scan_tui(previous: Optional[dict]) -> None:
         # Abort path: deliberately do NOT save. The previous run's JSON stays
         # on disk so --load-previous still recalls the prior good snapshot.
         sys.exit(130)
-    save_run(discovery.devices.values(), current_subnet, discovery.missing_devices)
+    save_run(discovery.devices.values(), current_subnet, discovery.missing_devices,
+             discovery.device_name)
 
 
 def _load_previous_tui(previous: Optional[dict]) -> None:
@@ -3912,7 +4276,9 @@ def main():
         return
 
     if "--print" in sys.argv:
-        discovery = NetworkDiscovery()
+        # Non-interactive: scan the best choice (the default route's network).
+        choices = list_network_choices()
+        discovery = NetworkDiscovery(choices[0] if choices else None)
         current_subnet = discovery._get_local_subnet()
         print(discovery.scan_header_text())
         ensure_manuf()
@@ -3927,7 +4293,8 @@ def main():
         except KeyboardInterrupt:
             sys.exit(130)
         discovery.print_results()
-        save_run(discovery.devices.values(), current_subnet, discovery.missing_devices)
+        save_run(discovery.devices.values(), current_subnet, discovery.missing_devices,
+                 discovery.device_name)
         return
 
     if "--load-previous" in sys.argv:
@@ -3935,7 +4302,7 @@ def main():
         return
 
     if "--new-scan" in sys.argv:
-        _run_new_scan_tui(load_previous_run())
+        _run_new_scan_tui()
         return
 
     history = list_history()
@@ -3953,28 +4320,39 @@ def main():
     #                                                sudo in cooked mode, then
     #                                                re-enter curses to scan.
     def _menu_session(stdscr):
-        choice = _startup_menu(stdscr, history)
-        if choice is None:
-            return None
-        action, payload = choice
-        # Wipe the menu so the next view's first paint isn't drawn over it.
-        stdscr.erase()
-        stdscr.refresh()
-        if action == "load":
-            data = load_run(payload["path"])
-            if not data:
+        choices = None  # listed lazily: only needed if the user picks "New scan"
+        while True:
+            choice = _startup_menu(stdscr, history)
+            if choice is None:
                 return None
-            discovery = NetworkDiscovery()
-            discovery.load_from(data)
-            CursesUI(discovery, review_timestamp=data.get("timestamp")).run(stdscr)
-            return None
-        # action == "new"
-        discovery = NetworkDiscovery()
+            action, payload = choice
+            # Wipe the menu so the next view's first paint isn't drawn over it.
+            stdscr.erase()
+            stdscr.refresh()
+            if action == "load":
+                data = load_run(payload["path"])
+                if not data:
+                    return None
+                discovery = NetworkDiscovery()
+                discovery.load_from(data)
+                CursesUI(discovery, review_timestamp=data.get("timestamp")).run(stdscr)
+                return None
+            # action == "new": pick the network, if there's more than one.
+            if choices is None:
+                choices = list_network_choices()
+            network = choices[0] if choices else None
+            if len(choices) > 1:
+                network = _network_menu(stdscr, choices, "ESC: back")
+                if network is None:
+                    continue  # back to the startup menu
+            break
+        discovery = NetworkDiscovery(network)
         current_subnet = discovery._get_local_subnet()
-        if history:
-            previous = load_run(history[0]["path"])
-            if previous and previous.get("subnet") == current_subnet:
-                discovery._pending_diff = previous
+        # Diff against the last run on this same subnet
+        entry = next((e for e in history if e["subnet"] == current_subnet), None)
+        previous = load_run(entry["path"]) if entry else None
+        if previous:
+            discovery._pending_diff = previous
         if _arp_requires_sudo_passwd_auth(discovery):
             # Need to ask the user for a password — must happen in cooked
             # terminal mode, so bail out of curses and let the caller run
@@ -4001,7 +4379,8 @@ def main():
         except KeyboardInterrupt:
             sys.exit(130)
 
-    save_run(discovery.devices.values(), current_subnet, discovery.missing_devices)
+    save_run(discovery.devices.values(), current_subnet, discovery.missing_devices,
+             discovery.device_name)
 
 
 if __name__ == "__main__":

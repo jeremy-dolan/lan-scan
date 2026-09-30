@@ -7,7 +7,7 @@ sweep, then enriches each device with UPnP device descriptions, HTTP banners,
 NetBIOS NBSTAT, IPP Get-Printer-Attributes, reverse DNS, and a few
 vendor-specific pokes (Roku, Philips Hue, ...). Results are browseable in a
 curses TUI or can be printed to stdout; scans are cached for later review and
-for highlighting differences between scans.
+for highlighting differences between runs.
 
 ## Requirements
 

@@ -64,10 +64,24 @@ For masks wider than `ARP_SWEEP_MAX_PREFIX`, the sweep targets a bounded window 
 local IP instead of the full range — sweeping a campus-sized subnet is pointless (almost
 nothing is reachable at layer 2) and slow. See `_arp_sweep_subnet` / `_get_local_prefixlen`.
 
+### Interface selection
+`list_network_choices()` enumerates scannable interfaces (IPv4, not link-local; UP +
+BROADCAST + MULTICAST with carrier; no LOOPBACK/POINTOPOINT, which drops VPN `utun*`) from
+`ifconfig` on macOS (labels via `networksetup -listallhardwareports`) or `ip -j` on Linux
+(labels via sysfs). Interfaces sharing a subnet fold into one `NetChoice`: we can't pick
+between e.g. Ethernet + Wi-Fi on the same LAN (unicast and the nmap sweep follow the routing
+table), so the choice's `interface` is whichever one the OS routes that subnet through. New
+TUI scans show a picker (`_network_menu`) when there's more than one choice; `--print` takes
+the default-route choice. The chosen interface drives subnet detection and the multicast
+sockets (`_pin_multicast`: `IP_MULTICAST_IF` + the mDNS membership). Unicast is left to
+routing, which is correct because every target is on-link on the chosen subnet — no sudoers
+change needed.
+
 ### Cache / persistence
 Everything lives under `~/.cache/lan-scan/`: the `manuf` OUI database and `history/*.json`
-(one file per run, ISO-8601 timestamp filename, pruned to `HISTORY_MAX=50`). Each scan is
-saved so the next scan can diff against it and review mode can rehydrate the exact display.
+(one file per run, ISO-8601 timestamp filename, pruned to `HISTORY_MAX=50`; each records its
+`subnet` and `device_name`). Each scan is saved so the next scan on the same subnet can diff
+against it and review mode can rehydrate the exact display.
 
 ## Architecture
 
