@@ -25,12 +25,18 @@ Options:
                       save). Exits 1 if there is no saved scan.
   --setup-sudoers     Print the sudoers entry needed for passwordless ARP
                       discovery via nmap.
+  -d, --device DEV    Scan the network on interface DEV (e.g. en0) instead of
+                      asking, or of the default route's network with --print.
+                      Applies to new scans only. Exits 2 if DEV isn't a
+                      scannable interface, or shares its LAN with another
+                      interface that the OS routes that LAN through.
 
 Default (no options): interactive prompt for new scan vs. load previous, then
 the curses TUI.
 ```
 
-These are mutually exclusive (`_MODE_FLAGS`).
+The mode flags are mutually exclusive (`_MODE_FLAGS`); `-d` combines with `--print`,
+`--new-scan`, or the default menu (where it skips the network picker).
 
 ### Driving / testing the TUI headlessly
 There is a project skill, **`run-lan-scan`** (`.claude/skills/run-lan-scan/`), for

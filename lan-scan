@@ -4241,6 +4241,11 @@ Options:
                       interactive prompt). Saves the run like the TUI does.
   --print-previous    Print the previously-saved scan (no scan, no TUI, no
                       save). Exits 1 if there is no saved scan.
+  -d, --device DEV    Scan the network on interface DEV (e.g. en0) instead of
+                      asking, or of the default route's network with --print.
+                      Applies to new scans only. Exits 2 if DEV isn't a
+                      scannable interface, or shares its LAN with another
+                      interface that the OS routes that LAN through.
   --setup-sudoers     Print the sudoers entry needed for passwordless ARP
                       discovery via nmap.
 
@@ -4249,8 +4254,8 @@ the curses TUI.
 """
 
 
-def _run_new_scan_tui() -> None:
-    choices = list_network_choices()
+def _run_new_scan_tui(forced: Optional[NetChoice] = None) -> None:
+    choices = [forced] if forced else list_network_choices()
     choice = choices[0] if choices else None
     if len(choices) > 1:
         try:
@@ -4298,6 +4303,45 @@ _MODE_FLAGS = (
 )
 
 
+def _device_arg() -> Optional[str]:
+    """The interface named by -d/--device (also --device=DEV), or None.
+    Exits 2 if the flag is given without a value."""
+    args = sys.argv[1:]
+    for i, arg in enumerate(args):
+        if arg.startswith("--device="):
+            value = arg.split("=", 1)[1]
+        elif arg in ("-d", "--device"):
+            value = args[i + 1] if i + 1 < len(args) else ""
+        else:
+            continue
+        if not value or value.startswith("-"):
+            print(f"{arg} needs an interface name, e.g. -d en0", file=sys.stderr)
+            sys.exit(2)
+        return value
+    return None
+
+
+def _choice_for_device(name: str) -> NetChoice:
+    """Resolve -d NAME to the network it's on, or exit 2 listing the
+    scannable interfaces. Naming an interface that shares its LAN with
+    another (see NetChoice) is refused: the scan couldn't actually go out
+    of it, since the OS routes that LAN's traffic via the other one."""
+    choices = list_network_choices()
+    for choice in choices:
+        if choice.interface.name == name:
+            return choice
+        if any(o.name == name for o in choice.others):
+            routed = choice.interface.name
+            print(f"Can't scan via {name}: it's on the same LAN ({choice.interface.subnet}) "
+                  f"as {routed}, and the OS sends that LAN's traffic via {routed}. "
+                  f"Use -d {routed} to scan this network.", file=sys.stderr)
+            sys.exit(2)
+    names = [i.name for c in choices for i in [c.interface, *c.others]]
+    print(f"No scannable network interface named {name!r}. "
+          f"Available: {', '.join(names) if names else 'none found'}", file=sys.stderr)
+    sys.exit(2)
+
+
 def main():
     if "--help" in sys.argv or "-h" in sys.argv:
         print(USAGE, end="")
@@ -4310,6 +4354,13 @@ def main():
             file=sys.stderr,
         )
         sys.exit(2)
+
+    device = _device_arg()
+    if device and selected and selected[0] not in ("--print", "--new-scan"):
+        print(f"-d/--device only applies to a new scan, not {selected[0]}.", file=sys.stderr)
+        sys.exit(2)
+    # Resolved up front so a bad name fails before anything else happens.
+    forced = _choice_for_device(device) if device else None
 
     if "--setup-sudoers" in sys.argv:
         sys.exit(setup_sudoers())
@@ -4327,8 +4378,9 @@ def main():
         return
 
     if "--print" in sys.argv:
-        # Non-interactive: scan the best choice (the default route's network).
-        choices = list_network_choices()
+        # Non-interactive: scan -d's network, else the best choice (the
+        # default route's network).
+        choices = [forced] if forced else list_network_choices()
         discovery = NetworkDiscovery(choices[0] if choices else None)
         current_subnet = discovery._get_local_subnet()
         print(discovery.scan_header_text())
@@ -4353,7 +4405,7 @@ def main():
         return
 
     if "--new-scan" in sys.argv:
-        _run_new_scan_tui()
+        _run_new_scan_tui(forced)
         return
 
     history = list_history()
@@ -4388,9 +4440,10 @@ def main():
                 discovery.load_from(data)
                 CursesUI(discovery, review_timestamp=data.get("timestamp")).run(stdscr)
                 return None
-            # action == "new": pick the network, if there's more than one.
+            # action == "new": pick the network (unless -d did), if there's
+            # more than one.
             if choices is None:
-                choices = list_network_choices()
+                choices = [forced] if forced else list_network_choices()
             network = choices[0] if choices else None
             if len(choices) > 1:
                 network = _network_menu(stdscr, choices, "ESC: back")
