@@ -737,22 +737,27 @@ def list_history() -> list[dict]:
     return entries
 
 
-def _friendly_time(iso_ts: Optional[str], pad_hour: bool = False) -> str:
+def _friendly_time(iso_ts: Optional[str], align: bool = False) -> str:
     """Render a saved ISO-8601 timestamp as a friendly absolute time, e.g.
     '1:25 PM, May 26' — or '4:40 PM, Mar 3, 2025' when the year differs from
     the current one. Falls back to the raw string if it doesn't parse.
-    With pad_hour, the hour is right-aligned to width 2 (' 1:25' vs '12:49')
-    so a column of these lines up; used by the load-scans menu."""
+    With align (the load-scans menu), the hour and day are right-aligned to
+    width 2 and the year is always shown (' 1:25 PM, Aug  8 2026') so a
+    column of these lines up."""
     try:
         dt = datetime.fromisoformat(iso_ts)
     except (ValueError, TypeError):
         return iso_ts or "?"
     hour = dt.hour % 12 or 12
-    hour_str = f"{hour:>2}" if pad_hour else str(hour)
+    hour_str = f"{hour:>2}" if align else str(hour)
     clock = f"{hour_str}:{dt.minute:02d} {'AM' if dt.hour < 12 else 'PM'}"
-    date = f"{dt.strftime('%b')} {dt.day}"           # "%-d" isn't portable; build it
-    if dt.year != datetime.now().year:
-        date += f", {dt.year}"
+    # "%-d" isn't portable; build the day by hand
+    if align:
+        date = f"{dt.strftime('%b')} {dt.day:>2} {dt.year}"
+    else:
+        date = f"{dt.strftime('%b')} {dt.day}"
+        if dt.year != datetime.now().year:
+            date += f", {dt.year}"
     return f"{clock}, {date}"
 
 
@@ -765,8 +770,8 @@ def _run_summary(n_devices: int, subnet: Optional[str], timestamp: Optional[str]
     the 'via' part is omitted when the device name is unknown (runs saved
     before it was recorded). With align (the menu's multi-row listing), the
     device count is right-aligned to width 3, the subnet left-aligned to the
-    widest CIDR, the device name to device_width, and the hour to width 2 so
-    the rows line up into columns."""
+    widest CIDR, the device name to device_width, and the time as described
+    in _friendly_time so the rows line up into columns."""
     count = f"{n_devices:>3}" if align else str(n_devices)
     summary = f"{count} {plural(n_devices, 'device')}"
     breakdown = []
@@ -785,7 +790,7 @@ def _run_summary(n_devices: int, subnet: Optional[str], timestamp: Optional[str]
         via = via.ljust(len(" via ") + device_width)
     summary += via
     if timestamp:
-        summary += f" at {_friendly_time(timestamp, pad_hour=align)}"
+        summary += f" at {_friendly_time(timestamp, align=align)}"
     return summary
 
 
