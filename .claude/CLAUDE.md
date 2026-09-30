@@ -86,7 +86,8 @@ change needed.
 ### Cache / persistence
 Everything lives under `~/.cache/lan-scan/`: the `manuf` OUI database and `history/*.json`
 (one file per run, ISO-8601 timestamp filename, pruned to `HISTORY_MAX=50`; each records its
-`subnet`, `device_name` and `gateway_mac`). Each scan is saved so the next scan of the same
+`subnet`, `device_name`, `gateway_mac`, and the `baseline_timestamp` of the run it was diffed
+against). Each scan is saved so the next scan of the same
 network can diff against it and review mode can rehydrate the exact display.
 
 ## Architecture

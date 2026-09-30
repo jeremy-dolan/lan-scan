@@ -763,12 +763,15 @@ def _friendly_time(iso_ts: Optional[str], align: bool = False) -> str:
 
 def _run_summary(n_devices: int, subnet: Optional[str], timestamp: Optional[str],
                  new: int = 0, missing: int = 0, align: bool = False,
-                 device_name: Optional[str] = None, device_width: int = 0) -> str:
+                 device_name: Optional[str] = None, device_width: int = 0,
+                 since: Optional[str] = None) -> str:
     """One-line scan summary shared by the load-scans menu and the TUI status
     bar, e.g. '26 devices (15 new, 11 missing) on 192.168.1.0/24 via en0 at
-    1:25 PM, May 26'. The new/missing breakdown is only passed for a live scan;
-    the 'via' part is omitted when the device name is unknown (runs saved
-    before it was recorded). With align (the menu's multi-row listing), the
+    1:25 PM, May 26'. The new/missing breakdown is only passed by the status
+    bar; with `since` (the diff baseline's timestamp) it becomes e.g. '(15 new,
+    11 missing since 9:30 PM, Sep 29)', or '(no changes since ...)'. The
+    'via' part is omitted when the device name is unknown (runs saved before
+    it was recorded). With align (the menu's multi-row listing), the
     device count is right-aligned to width 3, the subnet left-aligned to the
     widest CIDR, the device name to device_width, and the time as described
     in _friendly_time so the rows line up into columns."""
@@ -779,7 +782,10 @@ def _run_summary(n_devices: int, subnet: Optional[str], timestamp: Optional[str]
         breakdown.append(f"{new} new")
     if missing:
         breakdown.append(f"{missing} missing")
-    if breakdown:
+    if since:
+        changes = ", ".join(breakdown) if breakdown else "no changes"
+        summary += f" ({changes} since {_friendly_time(since)})"
+    elif breakdown:
         summary += " (" + ", ".join(breakdown) + ")"
     net = subnet or "?"
     if align:
@@ -795,7 +801,8 @@ def _run_summary(n_devices: int, subnet: Optional[str], timestamp: Optional[str]
 
 
 def save_run(devices, subnet: Optional[str], missing: Optional[list] = None,
-             device_name: Optional[str] = None, gateway_mac: Optional[str] = None) -> None:
+             device_name: Optional[str] = None, gateway_mac: Optional[str] = None,
+             baseline_timestamp: Optional[str] = None) -> None:
     """Persist this run's results so the next invocation can diff against it
     and review mode can rehydrate the exact display."""
     if not subnet:
@@ -806,6 +813,9 @@ def save_run(devices, subnet: Optional[str], missing: Optional[list] = None,
         "device_name": device_name,
         "gateway_mac": gateway_mac,
         "timestamp": timestamp,
+        # The run this one was diffed against, so reviewing it later can say
+        # what its new/missing marks are relative to.
+        "baseline_timestamp": baseline_timestamp,
         "devices": [_device_to_dict(d) for d in devices],
         "missing_devices": missing or [],
     }
@@ -1102,7 +1112,9 @@ class NetworkDiscovery:
         self.arp_table: dict[str, str] = {}
         # Populated by apply_diff(); list of dicts in the same shape as _device_to_dict
         self.missing_devices: list[dict] = []
-        self.previous_timestamp: Optional[str] = None
+        # Timestamp of the run diffed against: set by apply_diff() on a live
+        # scan, or from the saved run in review mode (load_from).
+        self.baseline_timestamp: Optional[str] = None
         # The scanned subnet, for the TUI status bar. Set during discover_arp on
         # a live scan, or from the saved run in review mode (load_from).
         self.subnet: Optional[str] = None
@@ -1121,7 +1133,7 @@ class NetworkDiscovery:
                 continue
             self.devices[device.address] = device
         self.missing_devices = previous.get("missing_devices", []) or []
-        self.previous_timestamp = previous.get("timestamp")
+        self.baseline_timestamp = previous.get("baseline_timestamp")
         self.subnet = previous.get("subnet")
         self.device_name = previous.get("device_name")
         self.gateway_mac = previous.get("gateway_mac")
@@ -1138,7 +1150,7 @@ class NetworkDiscovery:
 
         current_addrs = set(self.devices.keys())
         self.missing_devices = [d for d in previous_devices if d["address"] not in current_addrs]
-        self.previous_timestamp = previous.get("timestamp")
+        self.baseline_timestamp = previous.get("timestamp")
 
     def add_device(
         self,
@@ -2753,11 +2765,12 @@ class NetworkDiscovery:
         resolved = sum(1 for d in self.devices.values() if d.rdns_name)
         report(f"  Reverse DNS            {resolved:>3} resolved  ({time.monotonic() - start:.1f}s)")
 
-    def print_results(self, baseline_timestamp: Optional[str] = None):
+    def print_results(self):
         """Print discovered devices in a formatted table. Devices new since
         the previous run are marked '+', and ones missing since then follow,
-        marked '-' (what the TUI shows in green / dim). baseline_timestamp is
-        the run a live scan was just diffed against, for the summary line."""
+        marked '-' (what the TUI shows in green / dim). The summary names the
+        run diffed against, when known (runs saved before it was recorded
+        just get the counts)."""
         def by_address(addr: str):
             return tuple(map(int, addr.split(".")))
 
@@ -2775,9 +2788,9 @@ class NetworkDiscovery:
         summary = f"Found {n} {plural(n, 'device')}"
         n_new = sum(1 for d in self.devices.values() if d.is_new)
         n_missing = len(self.missing_devices)
-        if baseline_timestamp:
+        if self.baseline_timestamp:
             summary += (f": {n_new} new, {n_missing} missing since the scan at "
-                        f"{_friendly_time(baseline_timestamp)}")
+                        f"{_friendly_time(self.baseline_timestamp)}")
         elif n_new or n_missing:
             summary += f" ({n_new} new, {n_missing} missing)"
         print(summary + "\n")
@@ -3476,6 +3489,7 @@ class CursesUI:
                 self.review_timestamp or self.scan_timestamp,
                 new=new_count, missing=len(missing),
                 device_name=self.discovery.device_name,
+                since=self.discovery.baseline_timestamp,
             )
             stdscr.attron(curses.color_pair(2))
             stdscr.addnstr(height - 2, 0, summary.center(width - 1), width - 1)
@@ -4299,7 +4313,8 @@ def _run_new_scan_tui(forced: Optional[NetChoice] = None) -> None:
         # on disk so --load-previous still recalls the prior good snapshot.
         sys.exit(130)
     save_run(discovery.devices.values(), current_subnet, discovery.missing_devices,
-             discovery.device_name, discovery.gateway_mac)
+             discovery.device_name, discovery.gateway_mac,
+             baseline_timestamp=discovery.baseline_timestamp)
 
 
 def _load_previous_tui(previous: Optional[dict]) -> None:
@@ -4421,9 +4436,10 @@ def main():
         previous = load_diff_baseline(discovery.subnet, discovery.gateway_mac)
         if previous is not None:
             discovery.apply_diff(previous)
-        discovery.print_results(previous.get("timestamp") if previous else None)
+        discovery.print_results()
         save_run(discovery.devices.values(), current_subnet, discovery.missing_devices,
-                 discovery.device_name, discovery.gateway_mac)
+                 discovery.device_name, discovery.gateway_mac,
+                 baseline_timestamp=discovery.baseline_timestamp)
         return
 
     if "--load-previous" in sys.argv:
@@ -4505,7 +4521,8 @@ def main():
             sys.exit(130)
 
     save_run(discovery.devices.values(), current_subnet, discovery.missing_devices,
-             discovery.device_name, discovery.gateway_mac)
+             discovery.device_name, discovery.gateway_mac,
+             baseline_timestamp=discovery.baseline_timestamp)
 
 
 if __name__ == "__main__":
